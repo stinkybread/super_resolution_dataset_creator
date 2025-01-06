@@ -139,5 +139,7 @@ This script provides a robust solution with several key features:
 
 ## How to run 
 ```python visdistinct.py "path/to/image_folder" "path/to/new_image_folder" similarity_threshold```
+
 Example -
+
 ```python visdistinct.py "input_folder" "output_folder" 0.1```
