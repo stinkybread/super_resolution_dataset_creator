@@ -56,12 +56,11 @@ Key parameters in the script that you may want to adjust:
 
 ```python
 match_threshold = 0.3        # Threshold for frame matching
-scene_threshold = 0.25     # Scene change detection sensitivity for ffmpeg
-similarity_threshold = 4    # Threshold for filtering similar frames
+similarity_threshold = 4    # Threshold for filtering similar frames. Used after matching and before aligning to optimize workflow.
 img_align_scale = 2        # Scale factor for alignment
 begin_time = "00:00:00"  #Set where in the video to begin extracting frames from. If it is a TV show, and are extracting frames from multiple episodes, you may want to skip the first 90 seconds of the intro- so you would use "00:01:30"
 end_time = "00:00:00"  #Set where in the video to stop extracting frames from. If it is a TV show, and are extracting frames from multiple episodes, you may want to skip the last 90 seconds of the ending- so you would use "00:20:00"
-scene_threshold = 0.25  #Set how different should an image be to its preeceding frame for frame extraction
+scene_threshold = 0.25  #Scene change detection sensitivity for ffmpeg. Set how different should an image be to its preeceding frame for frame extraction
 similarity_threshold = 4  #Basic check to remove similar images before image matching
 lr_width, lr_height = 852, 480  #Set the resolution to set the video when extracting frames
 hr_width, hr_height = 1980, 1080  #Set the resolution to set the video when extracting frames
