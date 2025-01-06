@@ -137,3 +137,6 @@ This script provides a robust solution with several key features:
 6. Automatic output folder creation with timestamp
 7. Progress logging to both console and file
 8. Capability to detect your CPU and optimize accordingly to create threads and workers.
+
+## How to run 
+```python visdistinct.py "path/to/image_folder" "path/to/new_image_folder" num_of_images```
