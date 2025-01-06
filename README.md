@@ -20,8 +20,8 @@ A robust Python tool for extracting, matching, and aligning frames from low-reso
 
 ### Required Software
 - Python 3.6+
-- FFmpeg
-- ImgAlign tool
+- FFmpeg - https://www.ffmpeg.org/ - Needs to be in system PATH
+- ImgAlign tool - https://github.com/sonic41592/ImgAlign - Needs to be in system PATH
 - CUDA toolkit (optional, for GPU acceleration)
 
 ### Python Dependencies
