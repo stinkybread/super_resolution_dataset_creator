@@ -138,4 +138,6 @@ This script provides a robust solution with several key features:
 8. Capability to detect your CPU and optimize accordingly to create threads and workers.
 
 ## How to run 
-```python visdistinct.py "path/to/image_folder" "path/to/new_image_folder" num_of_images```
+```python visdistinct.py "path/to/image_folder" "path/to/new_image_folder" similarity_threshold```
+Example -
+```python visdistinct.py "input_folder" "output_folder" 0.1```
