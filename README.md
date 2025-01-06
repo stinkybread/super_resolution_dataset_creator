@@ -1,5 +1,6 @@
 The space currently hosts two Python scripts
-1 - image-pairer-updated_ver_4a
+1 - Image-Pairer
+2 - Visdistinct
 
 # Image-Pairer
 
