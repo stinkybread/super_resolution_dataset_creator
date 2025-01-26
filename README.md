@@ -1,6 +1,7 @@
 The space currently hosts two Python scripts
 1 - Image-Pairer
 2 - Visdistinct
+3 - Viscomplex
 
 # Image-Pairer
 
@@ -143,3 +144,65 @@ This script provides a robust solution with several key features:
 Example -
 
 ```python visdistinct.py "input_folder" "output_folder" 0.1```
+
+# Viscomplex
+
+A Python tool that selects optimal images for super-resolution model training by analyzing complexity and maintaining visual diversity.
+
+##Features
+
+Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
+CLIP-based similarity filtering for dataset diversity
+GPU acceleration when available
+System resource optimization
+Checkpoint system for long runs
+
+##Usage
+bashCopypython sisr_image_selector.py /path/to/images --complexity_threshold 0.4 --min_distance 0.15
+Output images are saved to /path/to/images_filtered
+
+##Requirements
+torch
+transformers
+opencv-python
+pillow
+scipy
+tqdm
+psutil
+
+##How It Works
+
+This script identifies high-quality images for super-resolution training through a two-stage process:
+Complexity Analysis:
+
+Uses multiple metrics: entropy (information density), edge density (detail level), local variance (texture), and Laplacian variance (sharpness)
+These metrics were chosen over alternatives (like BRISQUE or NIQE) because they:
+
+1. Directly measure features relevant to super-resolution (edges, textures, details)
+2. Are computationally efficient
+3. Don't require pre-trained models
+
+Weights: entropy (0.3), edge density (0.3), local variance (0.2), sharpness (0.2)
+Higher weights on entropy/edges prioritize detailed images with clear structures
+
+Similarity Filtering:
+
+Uses CLIP embeddings for semantic similarity
+Process:
+
+1. Sort by complexity score
+2. Keep images above complexity threshold
+3. Calculate pairwise cosine distances between CLIP embeddings
+4. Start with highest complexity image
+5. Iteratively add images that are sufficiently different (min_distance)
+
+
+CLIP chosen because it:
+
+1. Captures both semantic and visual similarities
+2. More robust than pixel-based or perceptual metrics
+3. GPU-accelerated when available
+
+The two-stage approach ensures both image quality and dataset diversity, critical for super-resolution model training.
+
+Ideal for creating high-quality, diverse super-resolution training datasets.
