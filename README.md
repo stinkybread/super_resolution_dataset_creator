@@ -151,24 +151,25 @@ A Python tool that selects optimal images for super-resolution model training by
 
 ## Features
 
-Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
-CLIP-based similarity filtering for dataset diversity
-GPU acceleration when available
-System resource optimization
-Checkpoint system for long runs
+1. Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
+2. CLIP-based similarity filtering for dataset diversity
+3. GPU acceleration when available
+4. System resource optimization
+5. Checkpoint system for long runs
 
 ## Usage
 bashCopypython sisr_image_selector.py /path/to/images --complexity_threshold 0.4 --min_distance 0.15
 Output images are saved to /path/to/images_filtered
 
 ## Requirements
-torch
-transformers
-opencv-python
-pillow
-scipy
-tqdm
-psutil
+
+1. torch
+2. transformers
+3. opencv-python
+4. pillow
+5. scipy
+6. tqdm
+7. psutil
 
 ## How It Works
 
