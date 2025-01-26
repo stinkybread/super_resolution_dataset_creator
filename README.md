@@ -149,7 +149,7 @@ Example -
 
 A Python tool that selects optimal images for super-resolution model training by analyzing complexity and maintaining visual diversity.
 
-##Features
+## Features
 
 Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
 CLIP-based similarity filtering for dataset diversity
@@ -157,11 +157,11 @@ GPU acceleration when available
 System resource optimization
 Checkpoint system for long runs
 
-##Usage
+## Usage
 bashCopypython sisr_image_selector.py /path/to/images --complexity_threshold 0.4 --min_distance 0.15
 Output images are saved to /path/to/images_filtered
 
-##Requirements
+## Requirements
 torch
 transformers
 opencv-python
@@ -170,7 +170,7 @@ scipy
 tqdm
 psutil
 
-##How It Works
+## How It Works
 
 This script identifies high-quality images for super-resolution training through a two-stage process:
 Complexity Analysis:
