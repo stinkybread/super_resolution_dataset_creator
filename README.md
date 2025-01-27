@@ -160,13 +160,16 @@ A Python tool that selects optimal images for super-resolution model training by
 
 1. Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
 2. CLIP-based similarity filtering for dataset diversity
-3. GPU acceleration when available
-4. System resource optimization
-5. Checkpoint system for long runs
+3. Brightness Threshold for image selection
+   a. 200: Filters very bright images
+   b. 180: More aggressive filtering
+   c. 220: Less aggressive filtering
+4. GPU acceleration when available
+5. System resource optimization
+6. Checkpoint system for long runs
 
 ## Usage
-bashCopypython sisr_image_selector.py /path/to/images --complexity_threshold 0.4 --min_distance 0.15
-Output images are saved to /path/to/images_filtered
+bashCopypython python sisr_image_selector.py "path/to/images" --complexity_threshold 0.4 --min_distance 0.15 --max_brightness 200
 
 ## Requirements
 
@@ -190,7 +193,7 @@ These metrics were chosen over alternatives (like BRISQUE or NIQE) because they:
 2. Are computationally efficient
 3. Don't require pre-trained models
 
-Weights: entropy (0.3), edge density (0.3), local variance (0.2), sharpness (0.2)
+Weights: entropy (0.4), edge density (0.4), sharpness (0.2)
 Higher weights on entropy/edges prioritize detailed images with clear structures
 
 Similarity Filtering:
