@@ -1,4 +1,20 @@
-def __init__(self, input_folder: str, output_folder: str = None):
+import torch
+from PIL import Image
+import cv2
+import numpy as np
+from pathlib import Path
+from transformers import CLIPProcessor, CLIPModel
+from scipy.stats import entropy
+import logging
+import shutil
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+import psutil
+import pickle
+
+class SuperResImageSelector:
+    def __init__(self, input_folder: str, output_folder: str = None):
         self.input_folder = Path(input_folder)
         if output_folder is None:
             self.output_folder = self.input_folder.parent / (self.input_folder.name + "_filtered")
@@ -21,47 +37,10 @@ def __init__(self, input_folder: str, output_folder: str = None):
         
         self.temp_dir = Path("temp_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
         self.temp_dir.mkdir(exist_ok=True)
-        self._setup_logging()import torch
-from PIL import Image
-import cv2
-import numpy as np
-from pathlib import Path
-from transformers import CLIPProcessor, CLIPModel
-from scipy.stats import entropy
-import logging
-import shutil
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
-import psutil
-import pickle
-import math
-
-class SuperResImageSelector:
-    def __init__(self, input_folder: str, output_folder: str = None):
-        self.input_folder = Path(input_folder)
-        if output_folder is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_folder = self.input_folder / f"super_res_candidates_{timestamp}"
-        self.output_folder = Path(output_folder)
-        
-        # System resource detection
-        self.total_ram = psutil.virtual_memory().total / (1024**3)  # GB
-        self.available_ram = psutil.virtual_memory().available / (1024**3)  # GB
-        self.cpu_count = psutil.cpu_count(logical=False)
-        
-        # Calculate optimal batch sizes
-        self.processing_batch_size = min(32, max(8, self.cpu_count * 2))
-        max_images_in_memory = int((self.available_ram * 0.7) / 0.01)  # Adjusting memory estimate
-        self.distance_batch_size = min(5000, max_images_in_memory)
-        
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
-        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        
         self._setup_logging()
-        self.checkpoint_dir = Path("checkpoints")
-        self.checkpoint_dir.mkdir(exist_ok=True)
+        
+        # Default brightness threshold
+        self.max_brightness = 200
 
     def _setup_logging(self):
         self.logger = logging.getLogger('SuperResImageSelector')
@@ -93,14 +72,6 @@ class SuperResImageSelector:
         with open(latest_checkpoint, 'rb') as f:
             return pickle.load(f)
 
-    def cleanup(self):
-        """Clean up temporary files and directories"""
-        try:
-            shutil.rmtree(self.temp_dir)
-            self.logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
-        except Exception as e:
-            self.logger.error(f"Error cleaning up: {e}")
-
     def calculate_complexity(self, image_path: Path) -> dict:
         """Calculate image complexity metrics"""
         try:
@@ -108,32 +79,41 @@ class SuperResImageSelector:
             if img is None:
                 return None
             
+            # Convert to HSV to get brightness
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            brightness = np.mean(hsv[:, :, 2])  # V channel represents brightness
+            
+            # Skip overly bright images
+            if brightness > self.max_brightness:
+                return None
+            
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
+            # Calculate entropy
             hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
             hist_norm = hist.ravel() / hist.sum()
             img_entropy = entropy(hist_norm)
             
+            # Calculate edge density
             edges = cv2.Canny(gray, 100, 200)
             edge_density = np.count_nonzero(edges) / edges.size
             
-            local_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            
-            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+            # Calculate sharpness using Laplacian variance (32-bit for efficiency)
+            laplacian = cv2.Laplacian(gray, cv2.CV_32F)
             sharpness = np.var(laplacian)
             
+            # Calculate overall complexity score
             complexity_score = (
-                0.3 * img_entropy +
-                0.3 * edge_density +
-                0.2 * (local_var / 1000) +
-                0.2 * (sharpness / 1000)
+                0.4 * img_entropy +
+                0.4 * edge_density +
+                0.2 * (sharpness / 1000)  # Normalized and weighted
             )
             
             return {
                 'entropy': img_entropy,
                 'edge_density': edge_density,
-                'local_variance': local_var,
                 'sharpness': sharpness,
+                'brightness': brightness,
                 'complexity_score': complexity_score
             }
         except Exception as e:
@@ -141,13 +121,17 @@ class SuperResImageSelector:
             return None
 
     def get_clip_features(self, image_path: Path) -> torch.Tensor:
+        """Extract CLIP features from image"""
         try:
             image = Image.open(image_path).convert('RGB')
             inputs = self.processor(images=image, return_tensors="pt").to(self.device)
             
             with torch.no_grad():
                 features = self.model.get_image_features(**inputs)
-                return features.cpu().flatten()
+                # Convert to float32 and normalize
+                features = features.float().cpu().flatten()
+                features = features / (torch.norm(features) + 1e-8)
+                return features
         except Exception as e:
             self.logger.error(f"Error getting CLIP features for {image_path}: {e}")
             return None
@@ -170,42 +154,6 @@ class SuperResImageSelector:
         except Exception as e:
             self.logger.error(f"Error analyzing {image_path}: {e}")
             return None
-
-    def process_batch(self, images: list, min_distance: float, prev_selected: set = None) -> list:
-        features = np.vstack([img['clip_features'].numpy() for img in images])
-        features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
-        
-        # Efficient similarity computation using numpy
-        distances = 1 - np.dot(features, features.T)
-        
-        selected_indices = []
-        available_indices = set(range(len(images)))
-        
-        if not prev_selected:
-            start_idx = max(range(len(images)), 
-                          key=lambda i: images[i]['complexity_score'])
-            selected_indices.append(start_idx)
-            available_indices.remove(start_idx)
-        
-        while available_indices:
-            current_distances = distances[list(available_indices)][:, selected_indices]
-            min_distances = np.min(current_distances, axis=1)
-            
-            valid_mask = min_distances >= min_distance
-            if not valid_mask.any():
-                break
-                
-            valid_indices = np.array(list(available_indices))[valid_mask]
-            complexity_scores = np.array([images[i]['complexity_score'] 
-                                        for i in valid_indices])
-            
-            selection_scores = min_distances[valid_mask] * complexity_scores
-            best_idx = valid_indices[selection_scores.argmax()]
-            
-            selected_indices.append(best_idx.item())
-            available_indices.remove(best_idx.item())
-        
-        return [images[i] for i in selected_indices]
 
     def select_images(self, min_distance: float = 0.15, complexity_threshold: float = 0.4):
         try:
@@ -238,13 +186,16 @@ class SuperResImageSelector:
             
             self.logger.info(f"Selected {len(complex_images)} complex images")
             
-            # Convert all features to numpy array
-            features = np.vstack([img['clip_features'].numpy() for img in complex_images])
+            # Convert all features to numpy array (float32)
+            features = np.vstack([img['clip_features'].numpy() for img in complex_images]).astype(np.float32)
             features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-8)
             
             # Calculate pairwise distances
             self.logger.info("Calculating pairwise distances...")
-            distances = 1 - np.dot(features, features.T)
+            similarities = np.dot(features, features.T)
+            np.clip(similarities, -1.0, 1.0, out=similarities)  # Numerical stability
+            distances = 1.0 - similarities
+            distances = distances.astype(np.float32)  # Convert to float32
             
             # Select diverse images
             selected_indices = []
@@ -300,6 +251,14 @@ class SuperResImageSelector:
         except Exception as e:
             self.logger.error(f"Error in copy process: {e}")
 
+    def cleanup(self):
+        """Clean up temporary files and directories"""
+        try:
+            shutil.rmtree(self.temp_dir)
+            self.logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up: {e}")
+
 if __name__ == "__main__":
     import argparse
     
@@ -309,10 +268,13 @@ if __name__ == "__main__":
                        help='Minimum CLIP distance between selected images')
     parser.add_argument('--complexity_threshold', type=float, default=0.4,
                        help='Minimum complexity score for selection')
+    parser.add_argument('--max_brightness', type=float, default=200,
+                       help='Maximum average brightness value (0-255)')
     
     args = parser.parse_args()
     
     selector = SuperResImageSelector(args.input_folder)
+    selector.max_brightness = args.max_brightness
     try:
         selector.copy_selected_images(args.min_distance, args.complexity_threshold)
     finally:
