@@ -105,7 +105,7 @@ Please review and adjust these parameters to suit your specific video sources an
 ## Usage
 
 1.  **Prepare Input Videos**: Place your LR videos in the `lr_input_video_folder` and corresponding HR videos (with matching filenames) in the `hr_input_video_folder`.
-2.  **Configure Pipeline**: Open `srdc_pipeline.py` and modify the configuration variables at the top as needed.
+2.  **Configure Pipeline**: Open `srdc_pipeline.py` and modify the configuration variables towards the bottom of the file as needed.
 3.  **Run Pipeline**: Execute the main script from your terminal:
     ```bash
     python srdc_pipeline.py
