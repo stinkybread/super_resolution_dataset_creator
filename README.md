@@ -5,215 +5,114 @@
 
 -------------------------------
 
-The space currently hosts two Python scripts
-1 - Image-Pairer
-2 - Visdistinct
-3 - Viscomplex
+# Video-to-Paired-Image Dataset Creation Pipeline (SRDC)
 
-# Image-Pairer
+This project provides a comprehensive Python-based pipeline for generating high-quality, paired Low-Resolution (LR) and High-Resolution (HR) image datasets from video sources. Such datasets are crucial for training Super-Resolution (SR) models and other image restoration tasks.
 
-A robust Python tool for extracting, matching, and aligning frames from low-resolution (LR) and high-resolution (HR) video pairs. This tool is particularly useful for creating training datasets for super-resolution models or video quality enhancement research.
+The pipeline automates various stages including frame extraction, deinterlacing, scene change detection, content-aware filtering, image matching, alignment, and advanced selection based on image complexity and visual uniqueness using CLIP.
 
 ## Features
 
-- GPU-accelerated frame processing with CUDA support (automatic fallback to CPU)
-- Intelligent scene detection and frame extraction using FFmpeg
-- Multi-threaded image matching and processing
-- Similarity-based filtering to remove redundant frames
-- Progress tracking with JSON-based checkpointing
-- Precise image alignment using ImgAlign
-- Support for multiple video formats (AVI, MP4, MKV)
+*   **Video Frame Extraction**: Extracts frames from LR and HR video pairs using FFmpeg.
+*   **Scene Change Detection**: Selects frames primarily from stable scenes, avoiding rapid transitions.
+*   **Deinterlacing**: Optional automatic or manual deinterlacing for interlaced video sources.
+*   **Autocropping**: Removes black borders from extracted frames.
+*   **Low-Information Filtering**: Discards overly plain or uninformative frames/pairs based on image variance.
+*   **LR/HR Frame Matching**: Accurately pairs corresponding LR and HR frames using template matching (with GPU acceleration).
+*   **Similarity Filtering**: Removes duplicate or near-duplicate image pairs using perceptual hashing (pHash).
+*   **Image Alignment**: Spatially aligns LR and HR image pairs using the [ImgAlign tool](https://github.com/NicholasGU/ImgAlign).
+*   **Advanced SISR Filtering**: Utilizes the `SuperResImageSelector` module to:
+    *   Calculate image complexity (entropy, edge density, sharpness) and brightness.
+    *   Extract CLIP (Contrastive Language-Image Pre-Training) visual features.
+    *   Select a diverse set of images suitable for SR training by filtering based on complexity, brightness, and CLIP feature distance.
+*   **Progress Tracking & Resumption**: Saves progress in a `progress.json` file, allowing the pipeline to be resumed.
+*   **Modular Design**: Each processing stage is distinct and can be configured or (in some cases) skipped.
+*   **Configurable**: Extensive options available directly in the main script (`srdc_pipeline.py`).
 
-## Prerequisites
+## System Requirements
 
-### Required Software
-- Python 3.6+
-- FFmpeg - https://www.ffmpeg.org/ - Needs to be in system PATH
-- ImgAlign tool - https://github.com/sonic41592/ImgAlign - Needs to be in system PATH
-- CUDA toolkit (optional, for GPU acceleration)
+*   Python 3.7+
+*   **Python Packages**:
+    *   `torch` & `torchvision`
+    *   `transformers`
+    *   `Pillow (PIL)`
+    *   `opencv-python` (cv2)
+    *   `scipy`
+    *   `numpy`
+    *   `tqdm`
+    *   `psutil`
+    *   `imagehash`
+    *   (A `requirements.txt` file would be beneficial)
+*   **External Tools**:
+    *   **FFmpeg**: Must be installed and accessible in your system's PATH. ([Download FFmpeg](https://ffmpeg.org/download.html))
+    *   **ImgAlign**: Must be compiled and accessible in your system's PATH. ([Download ImgAlign](https://github.com/NicholasGU/ImgAlign))
+*   **Hardware**:
+    *   A CUDA-capable GPU is highly recommended for significant speedups in PyTorch (CLIP) and OpenCV operations. The pipeline includes CPU fallbacks.
+    *   Sufficient RAM, especially for the `SuperResImageSelector` when processing a large number of candidate images.
+    *   Disk space for storing extracted frames and processed datasets.
 
-### Python Dependencies
-```bash
-pip install opencv-python
-pip install opencv-contrib-python
-pip install numpy
-pip install Pillow
-pip install imagehash
-pip install tqdm
-```
+## File Structure
+.
+├── srdc_pipeline.py # Main pipeline script (srdc_v3.py in your files)
+├── sisr_image_selector.py # Module for SISR-suitability filtering
+├── LR_VIDEOS/ # Your input Low-Resolution videos
+│ └── video1.mp4
+├── HR_VIDEOS/ # Your input High-Resolution videos
+│ └── video1.mp4
+└── OUTPUT_BASE_FOLDER/ # Root output directory (configurable)
+├── 1_EXTRACTED/
+│ ├── LR/
+│ │ └── video1/ # Frames per video
+│ │ └── frame_000001.png
+│ └── HR/
+│ └── video1/
+│ └── frame_000001.png
+├── 2_MATCHED/
+│ ├── LR/
+│ │ └── video1_frame_000001.png
+│ └── HR/
+│ └── video1_frame_000001.png
+├── 3_ALIGNED/
+│ ├── LR/
+│ ├── HR/
+│ └── Overlay/ # Alignment visualization
+├── 4_SISR_FILTERED/ # Optional final filtered output
+│ ├── LR/
+│ └── HR/
+├── progress.json # Tracks pipeline progress for resumption
+└── temp_YYYYMMDD_HHMMSS/ # Temporary directory for sisr_image_selector checkpoints
 
-### System Requirements
-- Minimum 8GB RAM (16GB recommended)
-- NVIDIA GPU with CUDA support (optional)
-- Sufficient storage space for extracted frames
-
-## Directory Structure
-```
-└── BASE_DIRECTORY
-    ├── LR              # Input low-resolution videos
-    ├── HR              # Input high-resolution videos
-    └── Output
-        ├── EXTRACTED   # Extracted frames
-        ├── MATCHED     # Matched frame pairs
-        └── ALIGNED     # Final aligned images
-```
 
 ## Configuration
 
-Key parameters in the script that you may want to adjust:
+All major configuration options are located at the beginning of the `srdc_pipeline.py` script. Key parameters include:
 
-```python
-match_threshold = 0.3        # Threshold for frame matching
-similarity_threshold = 4    # Threshold for filtering similar frames. Used after matching and before aligning to optimize workflow.
-img_align_scale = 2        # Scale factor for alignment
-begin_time = "00:00:00"  #Set where in the video to begin extracting frames from. If it is a TV show, and are extracting frames from multiple episodes, you may want to skip the first 90 seconds of the intro- so you would use "00:01:30"
-end_time = "00:00:00"  #Set where in the video to stop extracting frames from. If it is a TV show, and are extracting frames from multiple episodes, you may want to skip the last 90 seconds of the ending- so you would use "00:20:00"
-scene_threshold = 0.25  #Scene change detection sensitivity for ffmpeg. Set how different should an image be to its preeceding frame for frame extraction
-similarity_threshold = 4  #Basic check to remove similar images before image matching
-lr_width, lr_height = 852, 480  #Set the resolution to set the video when extracting frames
-hr_width, hr_height = 1980, 1080  #Set the resolution to set the video when extracting frames
-```
+*   Input/Output paths (`lr_input_video_folder`, `hr_input_video_folder`, `output_base_folder`).
+*   Frame extraction settings (`begin_time`, `end_time`, `scene_threshold`, scaling options).
+*   Deinterlacing options (`DEINTERLACE_MODE`, `DEINTERLACE_FILTER`).
+*   Autocropping settings (`CROP_BLACK_BORDERS`, `CROP_BLACK_THRESHOLD`).
+*   Low information filter settings (`ENABLE_LOW_INFO_FILTER`, `LOW_INFO_VARIANCE_THRESHOLD`).
+*   Matching parameters (`match_threshold`, `resize_height`, `resize_width`).
+*   Similarity (pHash) filter threshold (`similarity_threshold`).
+*   ImgAlign scale (`img_align_scale`).
+*   SISR filter settings (`ENABLE_SISR_FILTERING`, `SISR_MIN_CLIP_DISTANCE`, `SISR_COMPLEXITY_THRESHOLD`, `SISR_MAX_BRIGHTNESS`).
+
+Please review and adjust these parameters to suit your specific video sources and dataset requirements.
 
 ## Usage
 
-1. Place your LR and HR video pairs in their respective folders
-2. Configure the paths in the script:
-```python
-lr_input_video_folder = "path/to/LR"
-hr_input_video_folder = "path/to/HR"
-output_base_folder = "path/to/output"
-```
+1.  **Prepare Input Videos**: Place your LR videos in the `lr_input_video_folder` and corresponding HR videos (with matching filenames) in the `hr_input_video_folder`.
+2.  **Configure Pipeline**: Open `srdc_pipeline.py` and modify the configuration variables at the top as needed.
+3.  **Run Pipeline**: Execute the main script from your terminal:
+    ```bash
+    python srdc_pipeline.py
+    ```
+4.  **Monitor Progress**: The script will output progress to the console. Intermediate results will be saved in the configured `output_base_folder`.
+5.  **Resumption**: If the pipeline is interrupted, it can often be resumed by running the script again. It will attempt to pick up from the last completed stage/video based on `progress.json`.
 
-3. Run the script:
+### `sisr_image_selector.py` Standalone Usage
+
+While integrated into the main pipeline, `sisr_image_selector.py` can also be run as a standalone tool:
+
 ```bash
-python image-pairer.py
-```
-
-## Processing Stages
-
-1. **Preprocessing**: Extracts frames from video pairs using scene detection
-2. **Matching**: Pairs corresponding frames between LR and HR versions
-3. **Filtering**: Removes similar frames to reduce redundancy
-4. **Alignment**: Precisely aligns LR-HR pairs for training
-
-## Notes
-
-- Video filenames must match between LR and HR folders. Use mkvtoolnix to ensure all files are mkv files for ease of use.
-- Progress is automatically saved and can be resumed if interrupted
-- GPU acceleration is automatically used if available
-- The script includes extensive error handling and logging
-
-## Performance Considerations
-
-- Frame extraction speed depends on video length and scene threshold
-- GPU acceleration significantly improves matching speed
-- Processing time varies based on video resolution and length
-- Memory usage scales with frame size and count
-
-## License
-
-MIT License
-
-## Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
-
-## Acknowledgments
-
-- Uses FFmpeg for video processing
-- Uses ImgAlign for precise image alignment
-- OpenCV for image processing
-- CUDA for GPU acceleration
-
-# Visdistinct
-
-visdistinct helps create visually distinct dataset from a group of images. 
-Ideally used after your super resolution dataset is created to ensure the model has the right images to be trained on.
-Use the following command to ensure you have everything you need to get up and running 
-
-## Prerequisites
-```pip install torch torchvision transformers Pillow tqdm py-cpuinfo psutil```
-
-## Features
-This script provides a robust solution with several key features:
-1. Uses CLIP model for state-of-the-art visual feature extraction
-2. Comprehensive error handling and logging
-3. Support for multiple image formats
-4. Verification of image validity before processing
-5. Customizable minimum distance threshold
-6. Automatic output folder creation with timestamp
-7. Progress logging to both console and file
-8. Capability to detect your CPU and optimize accordingly to create threads and workers.
-
-## How to run 
-```python visdistinct.py "path/to/image_folder" "path/to/new_image_folder" similarity_threshold```
-
-Example -
-
-```python visdistinct.py "input_folder" "output_folder" 0.1```
-
-# Viscomplex
-
-A Python tool that selects optimal images for super-resolution model training by analyzing complexity and maintaining visual diversity.
-
-## Features
-
-1. Multi-metric complexity analysis (entropy, edge density, texture, sharpness)
-2. CLIP-based similarity filtering for dataset diversity
-3. Brightness Threshold for image selection
-   a. 200: Filters very bright images
-   b. 180: More aggressive filtering
-   c. 220: Less aggressive filtering
-4. GPU acceleration when available
-5. System resource optimization
-6. Checkpoint system for long runs
-
-## Usage
-bashCopypython python sisr_image_selector.py "path/to/images" --complexity_threshold 0.4 --min_distance 0.15 --max_brightness 200
-
-## Requirements
-
-1. torch
-2. transformers
-3. opencv-python
-4. pillow
-5. scipy
-6. tqdm
-7. psutil
-
-## How It Works
-
-This script identifies high-quality images for super-resolution training through a two-stage process:
-Complexity Analysis:
-
-Uses multiple metrics: entropy (information density), edge density (detail level), local variance (texture), and Laplacian variance (sharpness)
-These metrics were chosen over alternatives (like BRISQUE or NIQE) because they:
-
-1. Directly measure features relevant to super-resolution (edges, textures, details)
-2. Are computationally efficient
-3. Don't require pre-trained models
-
-Weights: entropy (0.4), edge density (0.4), sharpness (0.2)
-Higher weights on entropy/edges prioritize detailed images with clear structures
-
-Similarity Filtering:
-
-Uses CLIP embeddings for semantic similarity
-Process:
-
-1. Sort by complexity score
-2. Keep images above complexity threshold
-3. Calculate pairwise cosine distances between CLIP embeddings
-4. Start with highest complexity image
-5. Iteratively add images that are sufficiently different (min_distance)
-
-
-CLIP chosen because it:
-
-1. Captures both semantic and visual similarities
-2. More robust than pixel-based or perceptual metrics
-3. GPU-accelerated when available
-
-The two-stage approach ensures both image quality and dataset diversity, critical for super-resolution model training.
-
-Ideal for creating high-quality, diverse super-resolution training datasets.
+python sisr_image_selector.py <input_folder> [--min_distance 0.15] [--complexity_threshold 0.4] [--max_brightness 200]
