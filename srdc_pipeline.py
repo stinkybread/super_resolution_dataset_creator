@@ -810,9 +810,9 @@ if __name__ == "__main__":
     # --- Configuration Options ---
 
     # Input/Output Paths
-    lr_input_video_folder = "E:\\BTAS\\BTAS_DVD_LR"  # Path to the folder containing Low-Resolution videos
-    hr_input_video_folder = "E:\\BTAS\\BTAS_BD_HR" # Path to the folder containing High-Resolution videos
-    output_base_folder = "E:\\BTAS\\Output_SRDC_v2_Test" # Base directory where all processed files will be saved
+    lr_input_video_folder = "E:\\MyFolder\\LR"  # Path to the folder containing Low-Resolution videos
+    hr_input_video_folder = "E:\\MyFolder\\HR" # Path to the folder containing High-Resolution videos
+    output_base_folder = "E:\\MyFolder\\Output" # Base directory where all processed files will be saved
 
     # Frame Extraction & Preprocessing
     begin_time = "00:00:00"  # Start time for frame extraction "HH:MM:SS" (00:00:00 for beginning of video)
