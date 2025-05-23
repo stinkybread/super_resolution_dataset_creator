@@ -53,6 +53,7 @@ The pipeline automates various stages including frame extraction, deinterlacing,
     *   Disk space for storing extracted frames and processed datasets.
 
 ## File Structure
+```
 .
 ├── srdc_pipeline.py # Main pipeline script (srdc_v3.py in your files)
 ├── sisr_image_selector.py # Module for SISR-suitability filtering
@@ -82,6 +83,7 @@ The pipeline automates various stages including frame extraction, deinterlacing,
 │ └── HR/
 ├── progress.json # Tracks pipeline progress for resumption
 └── temp_YYYYMMDD_HHMMSS/ # Temporary directory for sisr_image_selector checkpoints
+```
 
 
 ## Configuration
