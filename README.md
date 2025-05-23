@@ -1,7 +1,8 @@
 ## Acknowledgements for Code & Inspiration
 1. Anthorpic's Calude (https://claude.ai/new)
-2. Enhance Everything Discord
-3. neosr - https://github.com/neosr-project/neosr
+2. Google AI Studio (https://aistudio.google.com/)
+3. Enhance Everything Discord
+4. neosr - https://github.com/neosr-project/neosr
 
 -------------------------------
 
