@@ -1,4 +1,4 @@
-# --- START OF MODIFIED FILE srdc_v2.py ---
+# srdc_pipeline.py - Complete SRDC Processing Pipeline
 
 import cv2
 import os
@@ -9,1009 +9,1380 @@ import glob
 import concurrent.futures
 import numpy as np
 import json
-import imagehash
-from PIL import Image # PIL is used for imagehash
-from collections import defaultdict
 import re
-from pathlib import Path # Added for pathlib operations
+from pathlib import Path
+from collections import defaultdict
+import time
 
-# Attempt to import SuperResImageSelector
+# Attempt to import ImageHash related libraries
 try:
-    from sisr_image_selector import SuperResImageSelector # Ensure sisr_image_selector.py is accessible
-    SISR_AVAILABLE = True
+    import imagehash
+    from PIL import Image
+    IMAGEHASH_AVAILABLE = True
 except ImportError:
-    print("Warning: sisr_image_selector.py not found or SuperResImageSelector class cannot be imported. SISR filtering will be unavailable.")
+    print("Warning: imagehash or Pillow not found. pHash similarity filtering will be unavailable.")
+    IMAGEHASH_AVAILABLE = False
+
+# Attempt to import SISR related libraries
+try:
+    import torch
+    from transformers import CLIPProcessor, CLIPModel
+    import psutil
+    import pickle
+    import logging
+    from scipy.stats import entropy
+    from datetime import datetime
+    from concurrent.futures import ThreadPoolExecutor
+    SISR_LIBRARIES_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: SISR libraries not found: {e}. SISR filtering will be unavailable.")
+    SISR_LIBRARIES_AVAILABLE = False
+
+# Configuration Import
+try:
+    import config
+except ImportError:
+    print("FATAL ERROR: config.py not found. Please ensure it exists in the same directory.")
+    exit(1)
+
+# SISR Image Selector Class
+if SISR_LIBRARIES_AVAILABLE:
+    class SuperResImageSelector:
+        def __init__(self, input_folder: str, output_folder: str = None, sisr_max_brightness=200):
+            self.input_folder = Path(input_folder)
+            if output_folder is None:
+                self.output_folder = None
+            else:
+                self.output_folder = Path(output_folder)
+
+            self.total_ram = psutil.virtual_memory().total / (1024**3)
+            self.available_ram = psutil.virtual_memory().available / (1024**3)
+            self.cpu_count = psutil.cpu_count(logical=False)
+
+            self.processing_batch_size = min(32, max(8, self.cpu_count * 2))
+            max_images_in_memory = int((self.available_ram * 0.7) / 0.01)
+            self.distance_batch_size = min(5000, max_images_in_memory)
+
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self.device == "cuda":
+                print(f"SISR: CUDA available. Using GPU for CLIP model.")
+                try:
+                    current_cuda_device = torch.cuda.current_device()
+                    print(f"SISR: CUDA device index: {current_cuda_device}")
+                    print(f"SISR: CUDA device name: {torch.cuda.get_device_name(current_cuda_device)}")
+                except Exception as e:
+                    print(f"SISR: Could not get CUDA device details: {e}")
+            else:
+                print(f"SISR: CUDA not available. Using CPU for CLIP model. This will be SLOW.")
+
+            self.model = None
+            self.processor = None
+            self.base_temp_folder = Path(config.OUTPUT_BASE_FOLDER) / "temp_sisr"
+            self.base_temp_folder.mkdir(parents=True, exist_ok=True)
+            self.temp_dir = self.base_temp_folder / ("sisr_run_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+            self.temp_dir.mkdir(exist_ok=True)
+
+            self._setup_logging()
+            self.max_brightness = sisr_max_brightness
+
+        def _load_model_processor(self):
+            if self.model is None or self.processor is None:
+                self.logger.info(f"SISR: Loading CLIP model and processor to {self.device}...")
+                try:
+                    self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(self.device)
+                    self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                    self.logger.info("SISR: CLIP model and processor loaded successfully.")
+                except Exception as e:
+                    self.logger.error(f"SISR: Failed to load CLIP model/processor: {e}")
+                    raise
+
+        def _setup_logging(self):
+            self.logger = logging.getLogger('SuperResImageSelector')
+            if not self.logger.hasHandlers():
+                self.logger.setLevel(logging.INFO)
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter('%(asctime)s - SISR - %(levelname)s - %(message)s')
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+                self.logger.propagate = False
+            self.logger.info(f"SISR: Resources: RAM Total={self.total_ram:.1f}GB, Avail={self.available_ram:.1f}GB, CPUs={self.cpu_count}")
+            self.logger.info(f"SISR: Batches: Processing={self.processing_batch_size}, Distance={self.distance_batch_size}")
+            self.logger.info(f"SISR: Max brightness: {self.max_brightness}")
+
+        def _save_checkpoint(self, data, step_name):
+            checkpoint_path = self.temp_dir / f"{step_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
+            try:
+                with open(checkpoint_path, 'wb') as f:
+                    pickle.dump(data, f)
+                self.logger.info(f"SISR: Saved checkpoint: {checkpoint_path.name}")
+            except Exception as e:
+                self.logger.error(f"SISR: Error saving checkpoint {checkpoint_path.name}: {e}")
+            return checkpoint_path
+
+        def _load_latest_checkpoint(self, step_name):
+            checkpoints = sorted(list(self.temp_dir.glob(f"{step_name}_*.pkl")), 
+                               key=lambda x: x.stat().st_mtime, reverse=True)
+            if not checkpoints:
+                return None
+            try:
+                with open(checkpoints[0], 'rb') as f:
+                    data = pickle.load(f)
+                self.logger.info(f"SISR: Loaded checkpoint: {checkpoints[0].name}")
+                return data
+            except Exception as e:
+                self.logger.error(f"SISR: Error loading checkpoint {checkpoints[0].name}: {e}")
+                try:
+                    checkpoints[0].unlink()
+                except OSError:
+                    pass
+                return None
+
+        def calculate_complexity(self, image_path: Path) -> dict:
+            try:
+                img = cv2.imread(str(image_path))
+                if img is None:
+                    self.logger.warning(f"SISR: Could not read {image_path} for complexity.")
+                    return None
+                
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                brightness = np.mean(hsv[:, :, 2])
+                if brightness > self.max_brightness:
+                    self.logger.debug(f"SISR: {image_path.name} too bright ({brightness:.2f}), skipping.")
+                    return None
+                
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+                hist_norm = hist.ravel() / (hist.sum() + 1e-8)
+                img_entropy = entropy(hist_norm)
+                
+                edges = cv2.Canny(gray, 100, 200)
+                edge_density = np.count_nonzero(edges) / (edges.size + 1e-8)
+                
+                laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+                sharpness = np.var(laplacian)
+                
+                complexity_score = max(0.0, min(1.0, (0.4 * img_entropy/8.0 + 0.4 * edge_density + 0.2 * min(1.0, sharpness / 2000.0))))
+                
+                return {
+                    'entropy': img_entropy,
+                    'edge_density': edge_density,
+                    'sharpness': sharpness,
+                    'brightness': brightness,
+                    'complexity_score': complexity_score
+                }
+            except Exception as e:
+                self.logger.error(f"SISR: Error calculating complexity for {image_path}: {e}")
+                return None
+
+        def get_clip_features(self, image_path: Path) -> torch.Tensor:
+            self._load_model_processor()
+            if self.model is None or self.processor is None:
+                self.logger.error("SISR: CLIP model/processor not available.")
+                return None
+            
+            try:
+                image = Image.open(image_path).convert('RGB')
+                inputs = self.processor(images=image, return_tensors="pt", padding=True, truncation=True).to(self.device)
+                with torch.no_grad():
+                    features = self.model.get_image_features(**inputs)
+                features = features.float().cpu().flatten()
+                return features / (torch.norm(features) + 1e-8)
+            except Exception as e:
+                self.logger.error(f"SISR: Error getting CLIP features for {image_path}: {e}")
+                return None
+
+        def analyze_image(self, image_path: Path) -> dict:
+            complexity_metrics = self.calculate_complexity(image_path)
+            if complexity_metrics is None:
+                return None
+            
+            clip_features = self.get_clip_features(image_path)
+            if clip_features is None:
+                return None
+            
+            return {'path': image_path, 'clip_features': clip_features, **complexity_metrics}
+
+        def select_images(self, min_distance: float = 0.15, complexity_threshold: float = 0.4):
+            self.logger.info(f"SISR: Starting selection. Min CLIP Dist: {min_distance}, Complexity Thresh: {complexity_threshold}")
+            self._load_model_processor()
+            if self.model is None or self.processor is None:
+                self.logger.error("SISR: CLIP model/processor N/A. Aborting.")
+                return []
+
+            analysis_checkpoint_name = f"analysis_{self.input_folder.name}"
+            results = self._load_latest_checkpoint(analysis_checkpoint_name)
+            
+            if results is None:
+                results = []
+                image_paths = [p for p in self.input_folder.glob('*') 
+                             if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}]
+                if not image_paths:
+                    self.logger.warning(f"SISR: No images in {self.input_folder}")
+                    return []
+                
+                self.logger.info(f"SISR: Analyzing {len(image_paths)} images...")
+                with ThreadPoolExecutor(max_workers=max(1, self.cpu_count // 2)) as executor:
+                    futures = [executor.submit(self.analyze_image, path) for path in image_paths]
+                    for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="SISR: Analyzing"):
+                        res = future.result()
+                        if res:
+                            results.append(res)
+                
+                self._save_checkpoint(results, analysis_checkpoint_name)
+            
+            if not results:
+                self.logger.error("SISR: No valid images after analysis.")
+                return []
+            
+            self.logger.info(f"SISR: Analysis complete. {len(results)} images processed.")
+
+            complex_images = [r for r in results if r['complexity_score'] >= complexity_threshold]
+            if not complex_images:
+                self.logger.warning(f"SISR: No images meet complexity {complexity_threshold}. Using all sorted by complexity.")
+                complex_images = sorted(results, key=lambda x: x['complexity_score'], reverse=True)
+            else:
+                complex_images.sort(key=lambda x: x['complexity_score'], reverse=True)
+            
+            if not complex_images:
+                self.logger.error("SISR: No images after complexity fallback.")
+                return []
+            
+            self.logger.info(f"SISR: {len(complex_images)} images after complexity filter/fallback.")
+
+            features_list = [img_data['clip_features'] for img_data in complex_images 
+                           if isinstance(img_data['clip_features'], torch.Tensor)]
+            if not features_list:
+                self.logger.error("SISR: No valid CLIP features for distance calculation.")
+                return []
+            
+            features_np = torch.stack(features_list).numpy().astype(np.float32)
+            if not features_np.any():
+                self.logger.warning("SISR: Features array empty/all zeros.")
+                return [img_data['path'] for img_data in complex_images]
+
+            selected_indices = [0]  # Start with most complex
+            num_features = features_np.shape[0]
+            self.logger.info(f"SISR: Selecting diverse images from {num_features} candidates...")
+            
+            with tqdm(total=num_features, desc="SISR: Selecting diverse", unit="img") as pbar:
+                pbar.update(1)
+                for i in range(1, num_features):
+                    if i % 500 == 0:
+                        pbar.set_description(f"SISR: Selecting diverse (Kept {len(selected_indices)})")
+                    
+                    current_feature = features_np[i]
+                    is_diverse = all(1.0 - np.dot(current_feature, features_np[sel_idx]) >= min_distance 
+                                   for sel_idx in selected_indices)
+                    if is_diverse:
+                        selected_indices.append(i)
+                    pbar.update(1)
+            
+            selected_paths = [complex_images[i]['path'] for i in selected_indices]
+            self.logger.info(f"SISR: Total selected: {len(selected_paths)} images.")
+            return selected_paths
+
+        def cleanup(self):
+            if self.temp_dir.exists():
+                try:
+                    shutil.rmtree(self.temp_dir)
+                except Exception as e:
+                    self.logger.error(f"SISR: Error cleaning temp_dir {self.temp_dir}: {e}")
+            
+            if self.base_temp_folder.exists() and not any(self.base_temp_folder.iterdir()):
+                try:
+                    self.base_temp_folder.rmdir()
+                except Exception as e:
+                    self.logger.debug(f"SISR: Could not remove base temp_dir {self.base_temp_folder}: {e}")
+
+    SISR_AVAILABLE = SISR_LIBRARIES_AVAILABLE
+else:
     SISR_AVAILABLE = False
-    class SuperResImageSelector: # Dummy class if import fails
+    class SuperResImageSelector:
         def __init__(self, *args, **kwargs):
-            print("ERROR: SuperResImageSelector is not available.")
+            print("ERROR: SuperResImageSelector not available (missing libraries).")
         def select_images(self, *args, **kwargs):
-            print("ERROR: SuperResImageSelector.select_images called but class is not available.")
+            print("ERROR: SuperResImageSelector.select_images N/A.")
             return []
         def cleanup(self):
             pass
 
+# Global variables for FFmpeg paths
+FFMPEG_PATH = config.FFMPEG_PATH
+FFPROBE_PATH = config.FFPROBE_PATH
 
-# Check CUDA availability and print OpenCV version
+def _find_executable(name, configured_path):
+    """Find executable in configured path or system PATH."""
+    if configured_path and Path(configured_path).is_file():
+        print(f"Using configured {name}: {configured_path}")
+        return str(configured_path)
+    
+    found_path = shutil.which(name)
+    if found_path:
+        print(f"Found {name} in PATH: {found_path}")
+        return found_path
+    
+    print(f"ERROR: {name} not found. Set path in config.py or install.")
+    return None
+
+# OpenCV and CUDA detection
 print(f"OpenCV version: {cv2.__version__}")
-print(f"CUDA available: {cv2.cuda.getCudaEnabledDeviceCount() > 0}")
+CUDA_AVAILABLE_OPENCV = cv2.cuda.getCudaEnabledDeviceCount() > 0
+print(f"OpenCV CUDA available: {CUDA_AVAILABLE_OPENCV}")
+use_gpu_opencv = CUDA_AVAILABLE_OPENCV
 
-use_gpu = cv2.cuda.getCudaEnabledDeviceCount() > 0
-
-if use_gpu:
-    print("CUDA-capable GPU detected. Using GPU acceleration.")
+if use_gpu_opencv:
+    print("OpenCV: CUDA GPU detected. Using GPU for OpenCV tasks where possible.")
     try:
-        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-             cuda_device = cv2.cuda.getDevice()
-             print(f"CUDA device index being used: {cuda_device}")
-             print(f"CUDA device name: {cv2.cuda.getDeviceName(cuda_device)}")
+        print(f"OpenCV: CUDA device: {cv2.cuda.getDeviceName(cv2.cuda.getDevice())}")
     except cv2.error as e:
-        print(f"Could not get CUDA device details: {e}")
-        use_gpu = False # Fallback if details fail
+        print(f"OpenCV: CUDA device details error: {e}")
+        use_gpu_opencv = False
 else:
-    print("No CUDA-capable GPU detected. Using CPU.")
+    print("OpenCV: No CUDA GPU for OpenCV. Using CPU.")
 
-def update_progress(progress_file, stage, video=None, completed=False, item_key='videos'):
-    progress = {}
-    if os.path.exists(progress_file):
+def update_progress(progress_file_path: Path, stage: str, item: str = None, completed: bool = False, item_key: str = 'items'):
+    """Update progress tracking file."""
+    progress_data = {}
+    if progress_file_path.exists():
         try:
-            with open(progress_file, 'r') as f:
-                progress = json.load(f)
+            with progress_file_path.open('r') as f:
+                progress_data = json.load(f)
         except json.JSONDecodeError:
-            print(f"Warning: Could not parse progress file {progress_file}. Starting fresh.")
-            progress = {}
+            print(f"Warning: Progress file {progress_file_path} corrupt. Starting fresh.")
+    
+    progress_data.setdefault(stage, {item_key: [], 'completed': False})
+    if not isinstance(progress_data[stage].get(item_key), list):
+        progress_data[stage][item_key] = []
+    
+    if item and item not in progress_data[stage][item_key]:
+        progress_data[stage][item_key].append(item)
+    
+    if completed:
+        progress_data[stage]['completed'] = True
+    elif item:
+        progress_data[stage]['completed'] = False
+    
+    try:
+        with progress_file_path.open('w') as f:
+            json.dump(progress_data, f, indent=4)
+    except IOError as e:
+        print(f"Error writing progress file {progress_file_path}: {e}")
 
-    if video: # 'video' here can mean a video filename or a video subfolder name
-        if stage not in progress:
-            progress[stage] = {item_key: []}
-        if item_key not in progress[stage] or not isinstance(progress[stage][item_key], list):
-             progress[stage][item_key] = []
-        if video not in progress[stage][item_key]:
-            progress[stage][item_key].append(video)
-    elif completed:
-        if stage not in progress:
-             progress[stage] = {}
-        progress[stage]['completed'] = True
-
-    with open(progress_file, 'w') as f:
-        json.dump(progress, f, indent=4)
-
-def get_progress(progress_file):
-    if os.path.exists(progress_file):
+def get_progress(progress_file_path: Path) -> dict:
+    """Get current progress from file."""
+    if progress_file_path.exists():
         try:
-            with open(progress_file, 'r') as f:
+            with progress_file_path.open('r') as f:
                 return json.load(f)
         except json.JSONDecodeError:
-             print(f"Warning: Could not parse progress file {progress_file}. Returning empty progress.")
-             return {}
+            print(f"Warning: Progress file {progress_file_path} corrupt. Returning empty.")
+            return {}
     return {}
 
-def detect_interlacing(video_path, probe_duration=10, frame_limit=300):
-    # ... (detect_interlacing function - no changes from previous version) ...
-    print(f"Probing interlacing for {os.path.basename(video_path)}...")
-    ffmpeg_cmd = [
-        "ffmpeg", "-hide_banner", "-filter:v", "idet", "-an", "-sn", "-dn",
-        "-t", str(probe_duration),
-        "-vf", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,1)',idet", # Process 1 frame per second
-        "-map", "0:v:0?", "-f", "null", "-threads", "1", "-nostats", "-i", video_path,
+def get_video_duration(video_path: Path) -> float | None:
+    """Get video duration using ffprobe."""
+    global FFPROBE_PATH
+    if not FFPROBE_PATH:
+        print("Error: ffprobe path not set for duration check.")
+        return None
+    
+    if not video_path.exists():
+        print(f"Error: Video file not found for duration: {video_path}")
+        return None
+    
+    cmd = [
+        FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)
     ]
+    
     try:
-        process = subprocess.run(ffmpeg_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, check=False)
-        stderr_output = process.stderr
-        tff_match = re.search(r"Single frame detection: TFF:\s*(\d+)", stderr_output)
-        bff_match = re.search(r"BFF:\s*(\d+)", stderr_output)
-        prog_match = re.search(r"Progressive:\s*(\d+)", stderr_output)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        return float(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        print(f"ffprobe timeout getting duration for {video_path.name}.")
+    except (subprocess.CalledProcessError, ValueError) as e:
+        print(f"ffprobe error getting duration for {video_path.name}: {e}")
+    return None
 
-        if tff_match and bff_match and prog_match:
-            tff_count = int(tff_match.group(1))
-            bff_count = int(bff_match.group(1))
-            prog_count = int(prog_match.group(1))
-            total_detected = tff_count + bff_count + prog_count
-            print(f"  Idet results: TFF={tff_count}, BFF={bff_count}, Progressive={prog_count}")
-            if total_detected == 0:
-                print("  Warning: idet filter detected 0 frames. Assuming progressive.")
+def detect_interlacing(video_path: Path, probe_duration: int = 10) -> bool:
+    """Detect if video is interlaced using ffmpeg idet filter."""
+    global FFMPEG_PATH
+    print(f"Probing interlacing for {video_path.name}...")
+    
+    cmd = [
+        FFMPEG_PATH, "-hide_banner", "-filter:v", "idet", "-an", "-sn", "-dn",
+        "-t", str(probe_duration), "-map", "0:v:0?", "-f", "null", "-threads", "1",
+        "-nostats", "-i", str(video_path)
+    ]
+    
+    try:
+        process = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, 
+                               text=True, check=False, timeout=60)
+        stderr = process.stderr
+        
+        tff = re.search(r"TFF:\s*(\d+)", stderr)
+        bff = re.search(r"BFF:\s*(\d+)", stderr)
+        prog = re.search(r"Progressive:\s*(\d+)", stderr)
+        
+        if tff and bff and prog:
+            t, b, p = int(tff.group(1)), int(bff.group(1)), int(prog.group(1))
+            total = t + b + p
+            print(f"  Idet: TFF={t}, BFF={b}, Prog={p}")
+            
+            if total == 0:
+                print("  Warning: idet 0 frames. Assuming progressive.")
                 return False
-            interlaced_ratio = (tff_count + bff_count) / total_detected
-            if interlaced_ratio > 0.25: # Adjusted threshold, more likely interlaced
-                print(f"  Detected as INTERLACED (ratio: {interlaced_ratio:.2f})")
-                return True
-            else:
-                print(f"  Detected as PROGRESSIVE (ratio: {interlaced_ratio:.2f})")
-                return False
-        else: # Fallback for different FFmpeg versions or output formats
-            rep_neither_match = re.search(r"Repeated Fields: Neither:\s*(\d+)", stderr_output)
-            rep_top_match = re.search(r"Top:\s*(\d+)", stderr_output)
-            rep_bottom_match = re.search(r"Bottom:\s*(\d+)", stderr_output)
-            if rep_neither_match and rep_top_match and rep_bottom_match:
-                rep_neither = int(rep_neither_match.group(1))
-                rep_top = int(rep_top_match.group(1))
-                rep_bottom = int(rep_bottom_match.group(1))
-                rep_total = rep_neither + rep_top + rep_bottom
-                print(f"  Idet results (Repeated Fields): Neither={rep_neither}, Top={rep_top}, Bottom={rep_bottom}")
-                if rep_total == 0:
-                    print("  Warning: idet filter detected 0 frames (repeated fields). Assuming progressive.")
-                    return False
-                interlaced_ratio = (rep_top + rep_bottom) / rep_total
-                if interlaced_ratio > 0.1: # Lower threshold for repeated fields
-                    print(f"  Detected as INTERLACED based on repeated fields (ratio: {interlaced_ratio:.2f})")
-                    return True
-                else:
-                    print(f"  Detected as PROGRESSIVE based on repeated fields (ratio: {interlaced_ratio:.2f})")
-                    return False
-            print(f"  Warning: Could not parse idet summary from ffmpeg output for {os.path.basename(video_path)}. Assuming progressive.")
-            # print(f"FFMPEG stderr for debug:\n{stderr_output}") # Uncomment for debugging idet
-            return False
-    except FileNotFoundError:
-        print("Error: ffmpeg command not found. Please ensure FFmpeg is installed and in your system's PATH.")
+            
+            interlaced_ratio = (t + b) / total
+            is_interlaced = interlaced_ratio > 0.25
+            print(f"  Detected as {'INTERLACED' if is_interlaced else 'PROGRESSIVE'} (ratio: {interlaced_ratio:.2f})")
+            return is_interlaced
+        
+        print(f"  Warning: Could not parse idet summary for {video_path.name}. Assuming progressive.")
         return False
     except Exception as e:
-        print(f"Error during interlacing detection for {os.path.basename(video_path)}: {e}")
+        print(f"Error during interlacing detection for {video_path.name}: {e}")
         return False
 
-
-def extract_frames_ffmpeg(video_path, output_folder, begin_time, end_time, scene_threshold,
-                          width=None, height=None, scale=None,
-                          video_type='unknown', deinterlace_mode='none',
-                          deinterlace_filter='bwdif=mode=send_frame:parity=auto'):
-    # ... (extract_frames_ffmpeg function - no changes from previous version) ...
-    os.makedirs(output_folder, exist_ok=True)
+def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str, end_time: str, 
+                         scene_threshold: float, width: int | None, height: int | None, 
+                         scale: float | None, video_type: str, deinterlace_mode: str, 
+                         deinterlace_filter: str):
+    """Extract frames using FFmpeg with optional deinterlacing."""
+    global FFMPEG_PATH
+    output_folder.mkdir(parents=True, exist_ok=True)
+    
     apply_deinterlace = False
-    interlace_detected_by_auto = False # Renamed for clarity
     if deinterlace_mode == 'auto':
-        is_interlaced = detect_interlacing(video_path)
-        if is_interlaced:
-            apply_deinterlace = True
-            interlace_detected_by_auto = True
-    elif deinterlace_mode == 'both': apply_deinterlace = True
-    elif deinterlace_mode == 'lr' and video_type == 'lr': apply_deinterlace = True
-    elif deinterlace_mode == 'hr' and video_type == 'hr': apply_deinterlace = True
+        apply_deinterlace = detect_interlacing(video_path)
+    elif deinterlace_mode == 'both':
+        apply_deinterlace = True
+    elif deinterlace_mode == 'lr' and video_type == 'lr':
+        apply_deinterlace = True
+    elif deinterlace_mode == 'hr' and video_type == 'hr':
+        apply_deinterlace = True
 
-    ffmpeg_command = ["ffmpeg", "-i", video_path]
+    cmd = [FFMPEG_PATH, "-i", str(video_path)]
+    
     if begin_time != "00:00:00" or end_time != "00:00:00":
-        ffmpeg_command.extend(["-ss", begin_time, "-to", end_time])
-    vf_filters = []
+        cmd.extend(["-ss", begin_time])
+        if end_time != "00:00:00":
+            cmd.extend(["-to", end_time])
+
+    vf = []
     if apply_deinterlace:
-        vf_filters.append(deinterlace_filter)
-        print(f"Applying deinterlace filter '{deinterlace_filter}' to {os.path.basename(video_path)}")
-    vf_filters.append(f"select='gt(scene,{scene_threshold})'")
-    if width and height: vf_filters.append(f"scale={width}:{height}")
-    elif scale: vf_filters.append(f"scale=iw*{scale}:ih*{scale}")
-    vf_filters.append("showinfo") # Keep showinfo for potential debugging, output is not parsed here
-    ffmpeg_command.extend(["-vf", ",".join(vf_filters), "-vsync", "vfr", "-q:v", "2", f"{output_folder}/frame_%06d.png"])
-    video_basename = os.path.basename(video_path)
-    print(f"\nExecuting FFmpeg for {video_basename}:\n  Command: {' '.join(ffmpeg_command)}")
+        vf.append(deinterlace_filter)
+        print(f"Applying deinterlace '{deinterlace_filter}' to {video_path.name}")
+    
+    vf.append(f"select='gt(scene,{scene_threshold})',showinfo")
+    
+    if width and height:
+        vf.append(f"scale={width}:{height}")
+    elif scale:
+        vf.append(f"scale=iw*{scale}:ih*{scale}")
+    
+    cmd.extend([
+        "-vf", ",".join(vf),
+        "-vsync", "vfr",
+        "-q:v", "2",
+        str(output_folder / "frame_%06d.png"),
+        "-hide_banner", "-loglevel", "info", "-nostats"
+    ])
+    
+    print(f"\nFFmpeg for {video_path.name}:\n  {' '.join(cmd)}")
+
+    timestamps, frame_files = [], []
+    duration = get_video_duration(video_path)
+
     try:
-        process = subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if "deprecated pixel format used" in process.stderr: # Check stderr for warnings
-             print(f"  Warning: Deprecated pixel format detected in {video_basename}.")
-        # Report deinterlacing status
-        deinterlace_msg = ""
-        if apply_deinterlace:
-            deinterlace_msg = " (Deinterlaced"
-            if interlace_detected_by_auto:
-                deinterlace_msg += " - Auto-Detected)"
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                 text=True, encoding='utf-8', errors='replace')
+        _, stderr = process.communicate(timeout=7200)  # 2hr timeout
+        
+        if process.returncode != 0:
+            print(f"Error extracting from {video_path.name} (code {process.returncode}):\n{stderr[-1000:]}")
+            return False, [], [], duration
+        
+        print(f"Frames extracted from {video_path.name}{' (Deinterlaced)' if apply_deinterlace else ''}")
+        
+        pts_re = re.compile(r'\[Parsed_showinfo.*pts_time:(\d+\.?\d*)')
+        timestamps = [float(m.group(1)) for m in pts_re.finditer(stderr)]
+        frame_files = sorted([f.name for f in output_folder.glob("frame_*.png")])
+        
+        n_frames, n_ts = len(frame_files), len(timestamps)
+        if n_frames == 0:
+            print(f"Warning: No frames saved for {video_path.name}.")
+            return False, [], [], duration
+        
+        if n_ts > n_frames:
+            timestamps = timestamps[:n_frames]
+        elif n_ts < n_frames:
+            print(f"Warning: Timestamps ({n_ts}) < Frames ({n_frames}) for {video_path.name}. Padding timestamps.")
+            if timestamps:
+                timestamps.extend([timestamps[-1]] * (n_frames - n_ts))
             else:
-                deinterlace_msg += ")"
-        print(f"Frames extracted successfully from {video_basename}{deinterlace_msg}")
-    except subprocess.CalledProcessError as e:
-        print(f"Error extracting frames from {video_basename}: {e}\n  FFmpeg stderr:\n{e.stderr}")
-    except FileNotFoundError:
-         print("Error: ffmpeg command not found. Please ensure FFmpeg is installed and in your system's PATH.")
+                print(f"ERROR: No timestamps parsed for {video_path.name} but frames exist.")
+                return False, [], [], duration
+        
+        return True, frame_files, timestamps, duration
+        
+    except Exception as e:
+        print(f"Error extracting {video_path.name}: {e}")
+        return False, [], [], duration
 
-
-def preprocess_videos(lr_input_folder, hr_input_folder, extracted_images_folder,
-                      begin_time, end_time, scene_threshold,
-                      lr_width=None, lr_height=None, lr_scale=None,
-                      hr_width=None, hr_height=None, hr_scale=None,
-                      deinterlace_mode='none', deinterlace_filter='bwdif=mode=send_frame:parity=auto',
-                      progress_file=None):
-    # ... (preprocess_videos function - no changes from previous version) ...
-    progress = get_progress(progress_file)
-    stage_name = 'preprocess'
-    if stage_name in progress and progress[stage_name].get('completed'):
+def preprocess_videos(lr_input_folder: Path, hr_input_folder: Path, extracted_images_folder: Path, progress_file: Path):
+    """Extract and timestamp frames from LR and HR videos."""
+    prog = get_progress(progress_file)
+    stage = 'preprocess'
+    if prog.get(stage, {}).get('completed', False):
         print("Preprocessing already completed. Skipping...")
-        return os.path.join(extracted_images_folder, "LR"), os.path.join(extracted_images_folder, "HR")
+        return extracted_images_folder / "LR", extracted_images_folder / "HR"
 
-    lr_base_path = os.path.join(extracted_images_folder, "LR")
-    hr_base_path = os.path.join(extracted_images_folder, "HR")
-    os.makedirs(lr_base_path, exist_ok=True); os.makedirs(hr_base_path, exist_ok=True)
-    allowed_extensions = ('.avi', '.mp4', '.mkv', '.ts', '.mpg', '.mpeg', '.mov', '.flv', '.wmv') # Added more
-    lr_video_files_all = sorted([f for f in os.listdir(lr_input_folder) if f.lower().endswith(allowed_extensions)])
-    hr_video_files_all = sorted([f for f in os.listdir(hr_input_folder) if f.lower().endswith(allowed_extensions)])
-    lr_video_map = {f.lower(): f for f in lr_video_files_all}
-    hr_video_map = {f.lower(): f for f in hr_video_files_all}
-    common_lower = set(lr_video_map.keys()) & set(hr_video_map.keys())
-    if len(common_lower) != len(lr_video_files_all) or len(common_lower) != len(hr_video_files_all):
-         print(f"Warning: LR and HR video lists do not perfectly match. Processing only common videos.\n  LR files ({len(lr_video_files_all)}): {', '.join(lr_video_files_all)}\n  HR files ({len(hr_video_files_all)}): {', '.join(hr_video_files_all)}\n  Common files ({len(common_lower)}): {', '.join(sorted(list(common_lower)))}")
-    video_files_to_process = sorted([lr_video_map[f_lower] for f_lower in common_lower])
-    if not video_files_to_process:
-         print("Error: No matching video files found. Exiting preprocessing.")
-         return lr_base_path, hr_base_path
-    processed_in_progress = progress.get(stage_name, {}).get('videos', [])
-    for video_file in tqdm(video_files_to_process, desc="Preprocessing videos"):
-        if video_file in processed_in_progress:
-            print(f"Skipping already processed video: {video_file}")
+    lr_base = extracted_images_folder / "LR"
+    hr_base = extracted_images_folder / "HR"
+    lr_base.mkdir(parents=True, exist_ok=True)
+    hr_base.mkdir(parents=True, exist_ok=True)
+    
+    exts = ('.avi', '.mp4', '.mkv', '.ts', '.mpg', '.mpeg', '.mov', '.flv', '.wmv', '.webm')
+    lrs = {f.name.lower(): f for f in lr_input_folder.iterdir() if f.is_file() and f.suffix.lower() in exts}
+    hrs = {f.name.lower(): f for f in hr_input_folder.iterdir() if f.is_file() and f.suffix.lower() in exts}
+    common = sorted(list(set(lrs.keys()) & set(hrs.keys())))
+    videos_map = {lrs[name]: hrs[name] for name in common}
+    
+    if len(videos_map) != len(lrs) or len(videos_map) != len(hrs):
+        print(f"Warning: Mismatch LR({len(lrs)})/HR({len(hrs)}). Processing {len(videos_map)} common.")
+    
+    if not videos_map:
+        print("Error: No matching videos. Exiting preprocess.")
+        update_progress(progress_file, stage, completed=True)
+        return lr_base, hr_base
+    
+    processed_items = prog.get(stage, {}).get('items', [])
+
+    for lr_path, hr_path in tqdm(videos_map.items(), desc="Preprocessing videos"):
+        if lr_path.name in processed_items:
+            print(f"Skipping processed: {lr_path.name}")
             continue
-        video_name_no_ext = os.path.splitext(video_file)[0] # Use this for subfolder names
-        hr_video_file = hr_video_map[video_file.lower()] # Get original HR filename
-        print(f"\n--- Processing {video_file} ---")
-        lr_video_path = os.path.join(lr_input_folder, video_file)
-        lr_output_folder = os.path.join(lr_base_path, video_name_no_ext) # Use video_name_no_ext
-        print(f"Extracting LR frames for {video_file}...")
-        extract_frames_ffmpeg(lr_video_path, lr_output_folder, begin_time, end_time, scene_threshold, lr_width, lr_height, lr_scale, 'lr', deinterlace_mode, deinterlace_filter)
-        hr_video_path = os.path.join(hr_input_folder, hr_video_file)
-        hr_output_folder = os.path.join(hr_base_path, video_name_no_ext) # Use video_name_no_ext
-        print(f"Extracting HR frames for {hr_video_file}...")
-        extract_frames_ffmpeg(hr_video_path, hr_output_folder, begin_time, end_time, scene_threshold, hr_width, hr_height, hr_scale, 'hr', deinterlace_mode, deinterlace_filter)
-        update_progress(progress_file, stage_name, video=video_file) # Track by original video filename
-    update_progress(progress_file, stage_name, completed=True)
+        
+        name_stem = lr_path.stem
+        print(f"\n--- Processing {lr_path.name} (LR) & {hr_path.name} (HR) ---")
+        
+        lr_out = lr_base / name_stem
+        print(f"Extracting LR for {lr_path.name}...")
+        lr_ok, lr_f, lr_ts, lr_dur = extract_frames_ffmpeg(
+            lr_path, lr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD,
+            config.LR_WIDTH, config.LR_HEIGHT, config.LR_SCALE, 'lr',
+            config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER
+        )
+        
+        if lr_ok and lr_f and lr_ts:
+            with (lr_out / config.METADATA_FILENAME).open('w') as f:
+                json.dump({"duration": lr_dur, "timestamps": dict(zip(lr_f, lr_ts))}, f, indent=4)
+        elif not lr_ok:
+            print(f"Skipping HR for {name_stem} due to LR failure.")
+            update_progress(progress_file, stage, item=lr_path.name)
+            continue
+        
+        hr_out = hr_base / name_stem
+        print(f"Extracting HR for {hr_path.name}...")
+        hr_ok, hr_f, hr_ts, hr_dur = extract_frames_ffmpeg(
+            hr_path, hr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD,
+            config.HR_WIDTH, config.HR_HEIGHT, config.HR_SCALE, 'hr',
+            config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER
+        )
+        
+        if hr_ok and hr_f and hr_ts:
+            with (hr_out / config.METADATA_FILENAME).open('w') as f:
+                json.dump({"duration": hr_dur, "timestamps": dict(zip(hr_f, hr_ts))}, f, indent=4)
+        
+        update_progress(progress_file, stage, item=lr_path.name)
+    
+    update_progress(progress_file, stage, completed=True)
     print("--- Preprocessing Finished ---")
-    return lr_base_path, hr_base_path
+    return lr_base, hr_base
 
-
-def autocrop_single_image(image_path, output_path, black_threshold=10, min_dimension=32):
-    # ... (autocrop_single_image function - no changes from previous version) ...
-    img = cv2.imread(image_path)
+def autocrop_single_image(img_path: Path, out_path: Path, thresh: int, min_dim: int):
+    """Autocrop black borders from a single image."""
+    img = cv2.imread(str(img_path))
     if img is None:
         return False
-
-    original_height, original_width = img.shape[:2]
+    
+    h_orig, w_orig = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, black_threshold, 255, cv2.THRESH_BINARY)
-
-    contours_tuple = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(contours_tuple) == 2: contours = contours_tuple[0]
-    else: contours = contours_tuple[1]
-
-    if not contours: return False
-
-    x_min, y_min, x_max, y_max = original_width, original_height, 0, 0
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        x_min = min(x_min, x); y_min = min(y_min, y)
-        x_max = max(x_max, x + w); y_max = max(y_max, y + h)
-
-    crop_w, crop_h = x_max - x_min, y_max - y_min
-    if crop_w < min_dimension or crop_h < min_dimension: return False
-    if x_min == 0 and y_min == 0 and x_max == original_width and y_max == original_height: return False
-
-    try: cv2.imwrite(output_path, img[y_min:y_max, x_min:x_max]); return True
-    except Exception: return False
-
-def autocrop_frames_in_folders(base_image_path, black_threshold, min_dimension, progress_file, stage_name_suffix=""):
-    # ... (autocrop_frames_in_folders function - no changes from previous version) ...
-    stage_name = f'autocrop{stage_name_suffix}'
-    progress = get_progress(progress_file)
-    if stage_name in progress and progress[stage_name].get('completed'):
-        print(f"Autocropping for {stage_name_suffix or 'images'} already completed. Skipping...")
-        return
-
-    print(f"--- Starting Autocropping for {os.path.basename(base_image_path)} ({stage_name_suffix}) ---")
-    try: video_folders = [f for f in os.listdir(base_image_path) if os.path.isdir(os.path.join(base_image_path, f))]
-    except FileNotFoundError: print(f"Error: Base path for autocropping not found: {base_image_path}"); update_progress(progress_file, stage_name, completed=True); return
-    if not video_folders: print(f"No video folders in {base_image_path} for autocropping."); update_progress(progress_file, stage_name, completed=True); return
-
-    processed_videos_in_progress = progress.get(stage_name, {}).get('videos', []) # Default item_key is 'videos'
-    total_processed_all, total_cropped_all = 0, 0
-    for video_folder_name in tqdm(video_folders, desc=f"Autocropping videos in {os.path.basename(base_image_path)}"):
-        if video_folder_name in processed_videos_in_progress: print(f"Skipping already autocropped: {video_folder_name}"); continue
-        current_video_frames_path = os.path.join(base_image_path, video_folder_name)
-        try: image_files = [f for f in os.listdir(current_video_frames_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        except FileNotFoundError: print(f"Warning: Image folder not found: {current_video_frames_path}. Skipping."); update_progress(progress_file, stage_name, video=video_folder_name); continue
-        if not image_files: update_progress(progress_file, stage_name, video=video_folder_name); continue
-        total_processed_all += len(image_files); cropped_this_video = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            futures = [executor.submit(autocrop_single_image, os.path.join(current_video_frames_path, img_f), os.path.join(current_video_frames_path, img_f), black_threshold, min_dimension) for img_f in image_files]
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Cropping {video_folder_name}", leave=False):
-                try:
-                    if future.result(): cropped_this_video += 1
-                except Exception as e: print(f"Error in autocropping worker for {video_folder_name}: {e}")
-        if cropped_this_video > 0: print(f"  Cropped {cropped_this_video} / {len(image_files)} images in {video_folder_name}.")
-        total_cropped_all += cropped_this_video; update_progress(progress_file, stage_name, video=video_folder_name) # Track by video_folder_name
-    print(f"--- Autocropping Finished for {os.path.basename(base_image_path)} ({stage_name_suffix}) ---\n    Total images processed: {total_processed_all}\n    Total images actually cropped: {total_cropped_all}")
-    update_progress(progress_file, stage_name, completed=True)
-
-
-# --- NEW FUNCTION for Low Information Filtering ---
-def check_image_variance(image_path, variance_threshold):
-    """Checks if the variance of an image is below a threshold."""
+    _, t = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+    cntrs = cv2.findContours(t, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cntrs = cntrs[0] if len(cntrs) == 2 else cntrs[1]
+    
+    if not cntrs:
+        return False
+    
+    x_min, y_min, x_max, y_max = w_orig, h_orig, 0, 0
+    for c in cntrs:
+        x, y, w, h = cv2.boundingRect(c)
+        x_min = min(x_min, x)
+        y_min = min(y_min, y)
+        x_max = max(x_max, x + w)
+        y_max = max(y_max, y + h)
+    
+    cw, ch = x_max - x_min, y_max - y_min
+    if cw < min_dim or ch < min_dim:
+        return False
+    
+    if x_min == 0 and y_min == 0 and x_max == w_orig and y_max == h_orig:
+        return False
+    
     try:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            # print(f"Warning: Could not read image {image_path} for variance check.")
-            return False # Treat as not low variance if unreadable
-        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        var = np.var(gray_img)
-        if var < variance_threshold:
-            # print(f"  Image {os.path.basename(image_path)} has low variance: {var:.2f}")
-            return True # Is low variance
-        return False # Not low variance
-    except Exception as e:
-        # print(f"Warning: Error checking variance for {image_path}: {e}")
+        cv2.imwrite(str(out_path), img[y_min:y_max, x_min:x_max])
+        return True
+    except Exception:
         return False
 
-def filter_low_information_images(base_lr_path_str, base_hr_path_str, variance_threshold, check_hr_too, progress_file):
-    stage_name = 'low_info_filter'
-    progress = get_progress(progress_file)
-    if stage_name in progress and progress[stage_name].get('completed'):
-        print("Low information image filtering already completed. Skipping...")
+def autocrop_frames_in_folders(base_path: Path, prog_file: Path, suffix: str = ""):
+    """Autocrop black borders from frames in all video folders."""
+    stage = f'autocrop{suffix}'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print(f"Autocrop {base_path.name}{suffix} done. Skip.")
         return
-
-    print(f"--- Starting Low Information Image Filtering ---")
-    print(f"  LR Base Path: {base_lr_path_str}")
-    print(f"  HR Base Path: {base_hr_path_str}")
-    print(f"  Variance Threshold: {variance_threshold}")
-    print(f"  Check HR images too: {check_hr_too}")
-
-    base_lr_path = Path(base_lr_path_str)
-    base_hr_path = Path(base_hr_path_str)
-
-    if not base_lr_path.is_dir():
-        print(f"Error: LR base path for low info filtering not found: {base_lr_path}")
-        update_progress(progress_file, stage_name, completed=True)
-        return
-
-    video_folders_lr = [f for f in os.listdir(base_lr_path) if os.path.isdir(base_lr_path / f)]
-    if not video_folders_lr:
-        print(f"No video subfolders found in {base_lr_path} for low info filtering.")
-        update_progress(progress_file, stage_name, completed=True)
-        return
-
-    processed_video_folders = progress.get(stage_name, {}).get('video_folders', [])
-    total_lr_removed = 0
-    total_hr_removed = 0
-
-    for video_folder_name in tqdm(video_folders_lr, desc="Filtering low info images by video folder"):
-        if video_folder_name in processed_video_folders:
-            print(f"Skipping already processed video folder for low info: {video_folder_name}")
-            continue
-
-        current_lr_video_path = base_lr_path / video_folder_name
-        current_hr_video_path = base_hr_path / video_folder_name # Corresponding HR video folder
-
-        try:
-            lr_image_files = [f for f in os.listdir(current_lr_video_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        except FileNotFoundError:
-            print(f"Warning: LR image folder not found: {current_lr_video_path}. Skipping.")
-            update_progress(progress_file, stage_name, video=video_folder_name, item_key='video_folders')
-            continue
-
-        removed_in_folder_lr = 0
-        removed_in_folder_hr = 0
-
-        for lr_img_file in tqdm(lr_image_files, desc=f"Checking LR in {video_folder_name}", leave=False):
-            lr_img_path = current_lr_video_path / lr_img_file
-            remove_pair = False
-
-            if check_image_variance(lr_img_path, variance_threshold):
-                remove_pair = True
-                # print(f"  Flagged LR {lr_img_path.name} for removal (low variance).")
-
-            if not remove_pair and check_hr_too:
-                hr_img_path = current_hr_video_path / lr_img_file # Assumes same filename
-                if hr_img_path.exists():
-                    if check_image_variance(hr_img_path, variance_threshold):
-                        remove_pair = True
-                        # print(f"  Flagged HR {hr_img_path.name} for removal (low variance), also removing LR.")
-                # else:
-                    # print(f"  HR counterpart {hr_img_path.name} not found for HR check.")
-
-
-            if remove_pair:
-                try:
-                    if lr_img_path.exists():
-                        lr_img_path.unlink()
-                        removed_in_folder_lr += 1
-                    hr_counterpart_path = current_hr_video_path / lr_img_file
-                    if hr_counterpart_path.exists():
-                        hr_counterpart_path.unlink()
-                        removed_in_folder_hr += 1
-                except OSError as e:
-                    print(f"Error removing low info image {lr_img_path.name} or its HR counterpart: {e}")
-        
-        if removed_in_folder_lr > 0:
-            print(f"  Removed {removed_in_folder_lr} LR images (and {removed_in_folder_hr} HR counterparts) from {video_folder_name} due to low information.")
-        total_lr_removed += removed_in_folder_lr
-        total_hr_removed += removed_in_folder_hr
-        update_progress(progress_file, stage_name, video=video_folder_name, item_key='video_folders')
-
-    print(f"--- Low Information Image Filtering Finished ---")
-    print(f"    Total LR images removed: {total_lr_removed}")
-    print(f"    Total HR images removed: {total_hr_removed}")
-    update_progress(progress_file, stage_name, completed=True)
-
-
-def process_image_pair(lr_img, hr_images, lr_folder, hr_folder, output_lr_folder, output_hr_folder, match_threshold, resize_height, resize_width, video_name):
-    # ... (process_image_pair function - no changes from previous version) ...
-    global use_gpu # Allow modification if GPU fails mid-process for a frame
-    lr_img_path = os.path.join(lr_folder, lr_img)
-    lr_frame = cv2.imread(lr_img_path)
-    if lr_frame is None: print(f"Warning: Could not read LR image {lr_img_path}. Skipping."); return 0
-
-    lr_gray, lr_frame_resized = None, None
-    gpu_active_for_lr = False
-    if use_gpu:
-        try:
-            lr_frame_gpu = cv2.cuda_GpuMat(); lr_frame_gpu.upload(lr_frame)
-            lr_frame_gpu_resized = cv2.cuda.resize(lr_frame_gpu, (resize_width, resize_height))
-            lr_gray_gpu = cv2.cuda.cvtColor(lr_frame_gpu_resized, cv2.COLOR_BGR2GRAY)
-            gpu_active_for_lr = True
-        except cv2.error as e: print(f"Warning: GPU error processing LR image {lr_img} ({e}). Falling back to CPU for this image."); use_gpu = False # Fallback for this pair
-    if not gpu_active_for_lr: # CPU path for LR or fallback
-        try:
-             lr_frame_resized = cv2.resize(lr_frame, (resize_width, resize_height))
-             lr_gray = cv2.cvtColor(lr_frame_resized, cv2.COLOR_BGR2GRAY)
-        except cv2.error as e: print(f"Error: CPU resize/cvtColor failed for LR image {lr_img_path}: {e}. Skipping pair."); return 0
-
-    best_match_hr_filename, best_score = None, float('inf')
-    for hr_img_filename in hr_images:
-        hr_img_path = os.path.join(hr_folder, hr_img_filename)
-        hr_frame = cv2.imread(hr_img_path)
-        if hr_frame is None: continue
-        current_score, gpu_active_for_hr = float('inf'), False
-        if use_gpu and gpu_active_for_lr: # Only try GPU for HR if LR GPU was successful
-             try:
-                 hr_frame_gpu = cv2.cuda_GpuMat(); hr_frame_gpu.upload(hr_frame)
-                 hr_frame_gpu_resized = cv2.cuda.resize(hr_frame_gpu, (resize_width, resize_height))
-                 hr_gray_gpu = cv2.cuda.cvtColor(hr_frame_gpu_resized, cv2.COLOR_BGR2GRAY)
-                 matcher = cv2.cuda.createTemplateMatching(cv2.CV_8UC1, cv2.TM_SQDIFF_NORMED) # CV_8UC1 for grayscale
-                 result_gpu = matcher.match(hr_gray_gpu, lr_gray_gpu) # Target (HR) searched in Source (LR)
-                 minVal, _, _, _ = cv2.cuda.minMaxLoc(result_gpu)
-                 current_score = minVal; gpu_active_for_hr = True
-             except cv2.error as e: print(f"Warning: GPU error processing HR image {hr_img_filename} ({e}). Fallback to CPU for this candidate.")
-        if not gpu_active_for_hr: # CPU path for HR or fallback
-             try:
-                hr_frame_resized = cv2.resize(hr_frame, (resize_width, resize_height))
-                hr_gray = cv2.cvtColor(hr_frame_resized, cv2.COLOR_BGR2GRAY)
-                # Ensure lr_gray is available if LR processing fell back to CPU
-                if lr_gray is None and lr_frame_resized is not None: # This lr_frame_resized is from CPU path
-                     lr_gray = cv2.cvtColor(lr_frame_resized, cv2.COLOR_BGR2GRAY)
-                if lr_gray is not None and hr_gray is not None:
-                     # Template matching: hr_gray is template, lr_gray is source
-                     result = cv2.matchTemplate(lr_gray, hr_gray, cv2.TM_SQDIFF_NORMED) # Search HR_template in LR_image
-                     minVal, _, _, _ = cv2.minMaxLoc(result); current_score = minVal
-                else: print(f"Error: Missing grayscale data for CPU match ({lr_img}, {hr_img_filename})."); current_score = float('inf')
-             except cv2.error as e: print(f"Error: CPU resize/match failed for HR image {hr_img_path}: {e}. Skipping candidate."); current_score = float('inf')
-        if current_score < best_score: best_score, best_match_hr_filename = current_score, hr_img_filename
-    if best_match_hr_filename is not None and best_score < match_threshold:
-        try:
-            lr_src_path = os.path.join(lr_folder, lr_img)
-            hr_src_path = os.path.join(hr_folder, best_match_hr_filename)
-            base_name_no_ext = os.path.splitext(lr_img)[0]
-            lr_dst_path = os.path.join(output_lr_folder, f"{video_name}_{base_name_no_ext}.png")
-            hr_dst_path = os.path.join(output_hr_folder, f"{video_name}_{base_name_no_ext}.png")
-            shutil.copy(lr_src_path, lr_dst_path); shutil.copy(hr_src_path, hr_dst_path)
-            return 1
-        except Exception as e: print(f"Error copying matched pair {lr_img}/{best_match_hr_filename}: {e}"); return 0
-    return 0
-
-def process_folder_pair(lr_base_path, hr_base_path, output_lr_base_path, output_hr_base_path, match_threshold, resize_height, resize_width, distance_modifier, progress_file):
-    # ... (process_folder_pair function - no changes from previous version) ...
-    progress = get_progress(progress_file)
-    stage_name = 'match'
-    if stage_name in progress and progress[stage_name].get('completed'): print("Matching already completed. Skipping..."); return
-    try:
-        # Ensure paths exist before listing
-        if not os.path.isdir(lr_base_path): print(f"Error: LR base path for matching not found: {lr_base_path}"); return
-        if not os.path.isdir(hr_base_path): print(f"Error: HR base path for matching not found: {hr_base_path}"); return
-        
-        lr_folders = {f for f in os.listdir(lr_base_path) if os.path.isdir(os.path.join(lr_base_path, f))}
-        hr_folders = {f for f in os.listdir(hr_base_path) if os.path.isdir(os.path.join(hr_base_path, f))}
-        common_folders = sorted(list(lr_folders & hr_folders))
-    except FileNotFoundError as e: print(f"Error: Input folder not found for matching: {e}. Check EXTRACTED paths."); return # Should be caught by isdir
-    if not common_folders: print("Error: No common video folders found for matching (e.g., in EXTRACTED/LR and EXTRACTED/HR)."); return
     
-    print(f"Found {len(common_folders)} common video folders for matching.")
-    processed_in_progress = progress.get(stage_name, {}).get('videos', []) # Default item_key is 'videos'
-
-    for folder_name in common_folders: 
-        if folder_name in processed_in_progress: print(f"Skipping already matched folder: {folder_name}"); continue
+    print(f"--- Autocropping {base_path.name}{suffix} ---")
+    if not base_path.is_dir():
+        print(f"Error: Path not found: {base_path}")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    vid_folders = [f for f in base_path.iterdir() if f.is_dir()]
+    if not vid_folders:
+        print(f"No subfolders in {base_path}.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    processed = prog_data.get(stage, {}).get('items', [])
+    total_proc, total_crop = 0, 0
+    
+    for vid_folder in tqdm(vid_folders, desc=f"Autocropping in {base_path.name}"):
+        if vid_folder.name in processed:
+            print(f"Skipping autocropped {vid_folder.name}")
+            continue
         
-        lr_folder_path = os.path.join(lr_base_path, folder_name); hr_folder_path = os.path.join(hr_base_path, folder_name)
+        imgs = list(vid_folder.glob('*.png'))
+        if not imgs:
+            update_progress(prog_file, stage, item=vid_folder.name)
+            continue
         
-        # Check if these specific subfolders exist
-        if not os.path.isdir(lr_folder_path): print(f"Warning: LR subfolder not found: {lr_folder_path}. Skipping for matching."); continue
-        if not os.path.isdir(hr_folder_path): print(f"Warning: HR subfolder not found: {hr_folder_path}. Skipping for matching."); continue
+        total_proc += len(imgs)
+        cropped_this = 0
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(autocrop_single_image, p, p, config.CROP_BLACK_THRESHOLD, 
+                              config.CROP_MIN_CONTENT_DIMENSION): p for p in imgs
+            }
+            for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), 
+                          desc=f"Cropping {vid_folder.name}", leave=False):
+                try:
+                    if fut.result():
+                        cropped_this += 1
+                except Exception as e:
+                    print(f"Autocrop error for {futures[fut].name}: {e}")
+        
+        if cropped_this > 0:
+            print(f"  Cropped {cropped_this}/{len(imgs)} in {vid_folder.name}.")
+        total_crop += cropped_this
+        update_progress(prog_file, stage, item=vid_folder.name)
+    
+    print(f"--- Autocrop {base_path.name}{suffix} Finished. Processed: {total_proc}, Cropped: {total_crop} ---")
+    update_progress(prog_file, stage, completed=True)
 
+def check_image_variance(img_path: Path, thresh: float):
+    """Check if image has low information content based on variance."""
+    try:
+        img = cv2.imread(str(img_path))
+        return np.var(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) < thresh if img is not None else False
+    except Exception:
+        return False
+
+def filter_low_information_images(lr_base: Path, hr_base: Path, prog_file: Path):
+    """Filter out low information images based on variance threshold."""
+    stage = 'low_info_filter'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print("Low info filter done. Skip.")
+        return
+    
+    print(f"--- Low Info Filter (Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD}, HR Check: {config.LOW_INFO_CHECK_HR_TOO}) ---")
+    if not lr_base.is_dir():
+        print(f"LR path not found: {lr_base}")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    vid_folders = [f for f in lr_base.iterdir() if f.is_dir()]
+    if not vid_folders:
+        print(f"No subfolders in {lr_base}.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    processed = prog_data.get(stage, {}).get('items', [])
+    tot_lr_rem, tot_hr_rem = 0, 0
+    
+    for lr_vid_f in tqdm(vid_folders, desc="Filtering low info"):
+        if lr_vid_f.name in processed:
+            print(f"Skipping low-info for {lr_vid_f.name}")
+            continue
+        
+        hr_vid_f = hr_base / lr_vid_f.name
+        if not hr_vid_f.is_dir():
+            print(f"HR folder {hr_vid_f} N/A. Skip {lr_vid_f.name}.")
+            update_progress(prog_file, stage, item=lr_vid_f.name)
+            continue
+        
+        lr_imgs = list(lr_vid_f.glob('*.png'))
+        lr_rem, hr_rem = 0, 0
+        
+        for lr_p in tqdm(lr_imgs, desc=f"Checking {lr_vid_f.name}", leave=False):
+            rm = check_image_variance(lr_p, config.LOW_INFO_VARIANCE_THRESHOLD)
+            if not rm and config.LOW_INFO_CHECK_HR_TOO:
+                hr_p = hr_vid_f / lr_p.name
+                if hr_p.exists():
+                    rm = check_image_variance(hr_p, config.LOW_INFO_VARIANCE_THRESHOLD)
+            
+            if rm:
+                try:
+                    lr_p.unlink()
+                    lr_rem += 1
+                except OSError as e:
+                    print(f"Err removing LR {lr_p.name}: {e}")
+                
+                hr_c = hr_vid_f / lr_p.name
+                if hr_c.exists():
+                    try:
+                        hr_c.unlink()
+                        hr_rem += 1
+                    except OSError as e:
+                        print(f"Err removing HR {hr_c.name}: {e}")
+        
+        if lr_rem > 0:
+            print(f"  Removed {lr_rem} LR (and {hr_rem} HR) from {lr_vid_f.name}.")
+        tot_lr_rem += lr_rem
+        tot_hr_rem += hr_rem
+        update_progress(prog_file, stage, item=lr_vid_f.name)
+    
+    print(f"--- Low Info Filter Finished. LR Rem: {tot_lr_rem}, HR Rem: {tot_hr_rem} ---")
+    update_progress(prog_file, stage, completed=True)
+
+def process_image_pair(lr_img_name: str, lr_folder_path: Path, lr_time: float,
+                      hr_candidate_img_names: list[str], hr_folder_path: Path, hr_timestamps_data: dict):
+    """Process a single LR image against HR candidates for matching."""
+    lr_img_path = lr_folder_path / lr_img_name
+    try:
+        lr_frame = cv2.imread(str(lr_img_path))
+        assert lr_frame is not None
+    except:
+        return None
+    
+    try:
+        lr_gray_resized = cv2.cvtColor(
+            cv2.resize(lr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                      interpolation=cv2.INTER_AREA), 
+            cv2.COLOR_BGR2GRAY
+        )
+    except cv2.error:
+        return None
+    
+    best_hr_name, best_score, matched_hr_ts = None, float('-inf'), None
+    
+    for hr_name in hr_candidate_img_names:
         try:
-            lr_images = sorted([f for f in os.listdir(lr_folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-            hr_images = sorted([f for f in os.listdir(hr_folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        except FileNotFoundError: # Should not happen if isdir checks pass, but as a safeguard
-            print(f"Warning: Image folders for '{folder_name}' became unavailable. Skipping."); continue
+            hr_frame = cv2.imread(str(hr_folder_path / hr_name))
+            assert hr_frame is not None
+            hr_gray_resized = cv2.cvtColor(
+                cv2.resize(hr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                          interpolation=cv2.INTER_AREA), 
+                cv2.COLOR_BGR2GRAY
+            )
+            
+            _, cur_score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(hr_gray_resized, lr_gray_resized, cv2.TM_CCOEFF_NORMED))
+            if cur_score > best_score:
+                best_score, best_hr_name, matched_hr_ts = cur_score, hr_name, hr_timestamps_data.get(hr_name)
+        except:
+            continue
+    
+    return (best_hr_name, best_score, lr_time, matched_hr_ts) if (
+        best_hr_name and best_score >= config.MATCH_THRESHOLD and matched_hr_ts is not None
+    ) else None
+
+def filter_temporal_inconsistency(matches: list, video_name: str) -> list:
+    """Filter matches to maintain temporal consistency."""
+    if not matches:
+        return []
+    
+    matches.sort(key=lambda x: x[2])  # Sort by lr_time
+    filtered, last_hr_ts = [], -1.0
+    
+    for lr_f, hr_f, lr_ts, hr_ts in matches:
+        if hr_ts >= last_hr_ts:
+            filtered.append((lr_f, hr_f, lr_ts, hr_ts))
+            last_hr_ts = hr_ts
+    
+    if removed := len(matches) - len(filtered):
+        print(f"  Temporal filter ({video_name}): Removed {removed} inconsistent HR matches.")
+    
+    return filtered
+
+def process_folder_pair(lr_extracted_base: Path, hr_extracted_base: Path,
+                       out_lr_matched: Path, out_hr_matched: Path, prog_file: Path):
+    """Process LR/HR folder pairs for frame matching."""
+    stage = 'match'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print("Matching done. Skip.")
+        return
+    
+    if not lr_extracted_base.is_dir() or not hr_extracted_base.is_dir():
+        print("Error: Extracted paths N/A for matching.")
+        return
+    
+    common_names = sorted(list(
+        {f.name for f in lr_extracted_base.iterdir() if f.is_dir()} & 
+        {f.name for f in hr_extracted_base.iterdir() if f.is_dir()}
+    ))
+    
+    if not common_names:
+        print("Error: No common video folders for matching.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    print(f"Found {len(common_names)} common video folders for matching.")
+    processed = prog_data.get(stage, {}).get('items', [])
+
+    for vid_name in common_names:
+        if vid_name in processed:
+            print(f"Skipping matched: {vid_name}")
+            continue
         
-        if not lr_images: print(f"Warning: No LR images in {lr_folder_path} for '{folder_name}'. Skipping."); continue
-        if not hr_images: print(f"Warning: No HR images in {hr_folder_path} for '{folder_name}'. Skipping."); continue
+        lr_fld = lr_extracted_base / vid_name
+        hr_fld = hr_extracted_base / vid_name
+        lr_meta_f = lr_fld / config.METADATA_FILENAME
+        hr_meta_f = hr_fld / config.METADATA_FILENAME
         
-        current_pair_count = 0 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            futures = [executor.submit(process_image_pair, lr_img, hr_images, lr_folder_path, hr_folder_path, output_lr_base_path, output_hr_base_path, match_threshold, resize_height, resize_width, folder_name) for lr_img in lr_images]
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Matching images for {folder_name}"):
-                try: current_pair_count += future.result()
-                except Exception as e: print(f"Error in matching worker for {folder_name}: {e}")
-        print(f"Total pairs created for {folder_name}: {current_pair_count}")
-        update_progress(progress_file, stage_name, video=folder_name) # Track by folder_name
-    update_progress(progress_file, stage_name, completed=True)
+        if not lr_meta_f.exists() or not hr_meta_f.exists():
+            print(f"Metadata missing for {vid_name}. Skip.")
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+        
+        try:
+            with lr_meta_f.open('r') as f:
+                lr_meta = json.load(f)
+            with hr_meta_f.open('r') as f:
+                hr_meta = json.load(f)
+            
+            lr_ts_data, lr_dur = lr_meta["timestamps"], lr_meta.get("duration")
+            hr_ts_data = hr_meta["timestamps"]
+            
+            if lr_dur is None or lr_dur <= 0:
+                lr_dur = config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS / config.INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE if config.INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE > 0 else 1800
+        except Exception as e:
+            print(f"Error loading metadata for {vid_name}: {e}. Skip.")
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+
+        lr_imgs = sorted([name for name in lr_ts_data if (lr_fld / name).exists()])
+        hr_imgs = sorted([name for name in hr_ts_data if (hr_fld / name).exists()])
+        
+        if not lr_imgs or not hr_imgs:
+            print(f"No valid images/timestamps for {vid_name}. Skip.")
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+
+        raw_matches, last_lr_ts, last_hr_ts, first_match_done = [], None, None, False
+        initial_win_secs = lr_dur * config.INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE if lr_dur > 0 else config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = {}
+            for lr_name in lr_imgs:
+                lr_time = lr_ts_data.get(lr_name)
+                if lr_time is None:
+                    continue
+                
+                min_hr_t, max_hr_t = 0, float('inf')
+                if not first_match_done:
+                    min_hr_t = lr_time - initial_win_secs
+                    max_hr_t = lr_time + initial_win_secs
+                elif last_lr_ts is not None and last_hr_ts is not None:
+                    expected_hr_t = last_hr_ts + (lr_time - last_lr_ts)
+                    min_hr_t = expected_hr_t - config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS
+                    max_hr_t = expected_hr_t + config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS
+                else:
+                    min_hr_t = lr_time - config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                    max_hr_t = lr_time + config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+
+                hr_candidates = [hr_n for hr_n in hr_imgs if min_hr_t <= hr_ts_data.get(hr_n, float('-inf')) <= max_hr_t]
+                if hr_candidates:
+                    fut = executor.submit(process_image_pair, lr_name, lr_fld, lr_time, hr_candidates, hr_fld, hr_ts_data)
+                    futures[fut] = (lr_name, lr_time)
+
+            for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Matching {vid_name}"):
+                lr_name_done, lr_time_done = futures[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        raw_matches.append((lr_name_done, res[0], res[2], res[3]))
+                        if not first_match_done or res[2] > last_lr_ts:
+                            last_lr_ts = res[2]
+                            last_hr_ts = res[3]
+                            first_match_done = True
+                except Exception as e:
+                    print(f"Match worker error for {lr_name_done} ({vid_name}): {e}")
+
+        consistent_matches = filter_temporal_inconsistency(raw_matches, vid_name)
+        copied = 0
+        
+        for lr_f, hr_f, _, _ in consistent_matches:
+            try:
+                lr_src, hr_src = lr_fld / lr_f, hr_fld / hr_f
+                stem = Path(lr_f).stem
+                lr_dst, hr_dst = out_lr_matched / f"{vid_name}_{stem}.png", out_hr_matched / f"{vid_name}_{stem}.png"
+                shutil.copy2(lr_src, lr_dst)
+                shutil.copy2(hr_src, hr_dst)
+                copied += 1
+            except Exception as e:
+                print(f"Error copying {lr_f}/{hr_f} for {vid_name}: {e}")
+        
+        print(f"Consistent pairs for {vid_name}: {len(consistent_matches)}, Copied: {copied}")
+        update_progress(prog_file, stage, item=vid_name)
+    
+    update_progress(prog_file, stage, completed=True)
     print("--- Matching Finished ---")
 
-
-def filter_similar_images(matched_lr_path, matched_hr_path, similarity_threshold=4, progress_file=None):
-    # ... (filter_similar_images function - no changes from previous version) ...
-    progress = get_progress(progress_file)
-    stage_name = 'filter_phash' # Changed stage name for clarity
-    if stage_name in progress and progress[stage_name].get('completed'): print("Similarity filtering (phash) already completed. Skipping..."); return 0
-    print("Starting similarity detection and filtering (perceptual hash)...") # Clarified title
-    try:
-        if not os.path.isdir(matched_lr_path): print(f"Error: Matched LR path for filtering not found: {matched_lr_path}"); return 0
-        if not os.path.isdir(matched_hr_path): print(f"Error: Matched HR path for filtering not found: {matched_hr_path}"); return 0
-        lr_images_all = sorted([f for f in os.listdir(matched_lr_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    except Exception as e: print(f"Error listing matched images for filtering: {e}"); return 0
-    if not lr_images_all: print("No matched images found to filter (phash)."); update_progress(progress_file, stage_name, completed=True); return 0
-
-    video_groups = defaultdict(list)
-    for img_filename in lr_images_all: 
-        # Regex to capture video name: assumes format VIDEO-NAME_frame_XXXXXX.png
-        match = re.match(r"([^_]+)_frame_\d+\.png", img_filename) 
-        if match: video_groups[match.group(1)].append(img_filename)
-        else: print(f"Warning: Could not determine video name from '{img_filename}' for phash filter. Grouping as 'unknown_video_group'."); video_groups['unknown_video_group'].append(img_filename)
-
-    total_removed_count = 0 
-    processed_videos_in_progress = progress.get(stage_name, {}).get('videos', []) # Default item_key is 'videos'
-    for video_name, images_in_group in tqdm(video_groups.items(), desc="Filtering similar images (phash) by video"): 
-        if video_name == 'unknown_video_group': 
-            print("Skipping 'unknown_video_group' for phash filtering as filenames are not standard.")
-            continue
-        if video_name in processed_videos_in_progress: print(f"Skipping already phash-filtered video group: {video_name}"); continue
-        
-        kept_hashes_and_filenames = {} 
-        filenames_to_remove = set() 
-        images_in_group.sort() 
-
-        for img_filename in tqdm(images_in_group, desc=f"Hashing {video_name}", leave=False):
-            lr_image_path = os.path.join(matched_lr_path, img_filename)
-            hr_image_path = os.path.join(matched_hr_path, img_filename) 
-            if not os.path.exists(lr_image_path) or not os.path.exists(hr_image_path):
-                 print(f"Warning: Missing LR or HR file for {img_filename} during phash filtering. Skipping.")
-                 continue
-            try:
-                with Image.open(lr_image_path) as img_pil: current_img_hash = imagehash.phash(img_pil) 
-            except Exception as e: print(f"Warning: Could not hash {lr_image_path}: {e}. Skipping this image."); continue
-
-            is_similar_found = False 
-            hashes_to_check = list(kept_hashes_and_filenames.keys()) 
-            for kept_hash in hashes_to_check:
-                kept_filename = kept_hashes_and_filenames[kept_hash]
-                if (current_img_hash - kept_hash) < similarity_threshold:
-                    try:
-                        current_lr_size = os.path.getsize(lr_image_path)
-                        kept_lr_size = os.path.getsize(os.path.join(matched_lr_path, kept_filename))
-                        if current_lr_size > kept_lr_size:
-                            filenames_to_remove.add(kept_filename)
-                            del kept_hashes_and_filenames[kept_hash] 
-                            kept_hashes_and_filenames[current_img_hash] = img_filename 
-                        else:
-                            filenames_to_remove.add(img_filename)
-                        is_similar_found = True; break
-                    except Exception as e: 
-                        print(f"Warning: Error comparing sizes for {img_filename}/{kept_filename}: {e}. Removing current.");
-                        filenames_to_remove.add(img_filename); is_similar_found = True; break
-            if not is_similar_found: kept_hashes_and_filenames[current_img_hash] = img_filename
-
-        removed_count_this_group = 0 
-        for img_filename_to_remove in filenames_to_remove:
-            try:
-                lr_file_to_remove = os.path.join(matched_lr_path, img_filename_to_remove)
-                hr_file_to_remove = os.path.join(matched_hr_path, img_filename_to_remove)
-                if os.path.exists(lr_file_to_remove): os.remove(lr_file_to_remove)
-                if os.path.exists(hr_file_to_remove): os.remove(hr_file_to_remove)
-                removed_count_this_group += 1
-            except OSError as e: print(f"Error removing similar image file {img_filename_to_remove}: {e}")
-        if removed_count_this_group > 0 : print(f"Removed {removed_count_this_group} similar image pairs (phash) from group {video_name}.")
-        total_removed_count += removed_count_this_group
-        update_progress(progress_file, stage_name, video=video_name) # Track by video_name
-
-    print(f"\nSimilarity filtering (phash) completed. Total removed: {total_removed_count} similar image pairs.")
-    update_progress(progress_file, stage_name, completed=True)
-    print("--- Phash Filtering Finished ---")
-    return total_removed_count
-
-
-def align_images(output_lr_base_path, output_hr_base_path, aligned_output_base_path, img_align_scale, progress_file=None):
-    # ... (align_images function - no changes from previous version) ...
-    progress = get_progress(progress_file)
-    stage_name = 'align'
-    if stage_name in progress and progress[stage_name].get('completed'): print("Alignment already completed. Skipping..."); return
-    if not shutil.which("ImgAlign"): print("Error: ImgAlign executable not found in PATH. Skipping alignment."); return
-    if os.path.exists(aligned_output_base_path): print(f"Removing existing alignment output directory: {aligned_output_base_path}"); shutil.rmtree(aligned_output_base_path)
-    os.makedirs(aligned_output_base_path); print(f"Created fresh alignment output directory: {aligned_output_base_path}")
-    try:
-        if not os.path.isdir(output_lr_base_path): print(f"Error: Matched LR path for alignment not found: {output_lr_base_path}"); return
-        lr_images_for_alignment = sorted([f for f in os.listdir(output_lr_base_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]) # Renamed
-        if not lr_images_for_alignment: print("No matched images found to align."); update_progress(progress_file, stage_name, completed=True); return
-    except Exception as e: print(f"Error listing images for alignment: {e}"); return
-    print(f"Starting image alignment for {len(lr_images_for_alignment)} pairs...")
-
-    video_groups = defaultdict(list)
-    for img_filename in lr_images_for_alignment: # Renamed
-        match = re.match(r"([^_]+)_frame_\d+\.png", img_filename) # Consistent regex
-        if match: video_groups[match.group(1)].append(img_filename)
-        else: print(f"Warning: Could not determine video name from '{img_filename}' for alignment. Grouping as 'unknown_alignment_group'."); video_groups['unknown_alignment_group'].append(img_filename)
-
-    processed_videos_in_progress = progress.get(stage_name, {}).get('videos', []) # Default item_key 'videos'
-    final_aligned_lr_path = os.path.join(aligned_output_base_path, "LR")
-    final_aligned_hr_path = os.path.join(aligned_output_base_path, "HR")
-    final_aligned_overlay_path = os.path.join(aligned_output_base_path, "Overlay")
-    os.makedirs(final_aligned_lr_path, exist_ok=True); os.makedirs(final_aligned_hr_path, exist_ok=True); os.makedirs(final_aligned_overlay_path, exist_ok=True)
-
-    for video_name, images_in_group in tqdm(video_groups.items(), desc="Aligning videos", unit="video"): # Renamed
-        if video_name == 'unknown_alignment_group': print(f"Skipping alignment for 'unknown_alignment_group'."); continue
-        if video_name in processed_videos_in_progress: print(f"Skipping already aligned video: {video_name}"); continue
-        print(f"\nAligning images for video group: {video_name}...")
-        
-        temp_batch_base = os.path.join(aligned_output_base_path, f"__temp_align_{video_name}")
-        temp_batch_lr_input = os.path.join(temp_batch_base, "lr_input_batch")
-        temp_batch_hr_input = os.path.join(temp_batch_base, "hr_input_batch")
-        temp_batch_aligned_output = os.path.join(temp_batch_base, "aligned_output_batch")
-        # Clean up previous temp batch if it exists (e.g. from a failed run)
-        if os.path.exists(temp_batch_base): shutil.rmtree(temp_batch_base)
-        os.makedirs(temp_batch_lr_input, exist_ok=True); os.makedirs(temp_batch_hr_input, exist_ok=True); os.makedirs(temp_batch_aligned_output, exist_ok=True)
-
-        print(f"  Copying {len(images_in_group)} pairs to temporary batch folders for {video_name}...")
-        valid_images_for_this_batch = [] # Renamed
-        for img_filename in tqdm(images_in_group, desc=f"Preparing batch {video_name}", leave=False):
-            src_lr = os.path.join(output_lr_base_path, img_filename)
-            src_hr = os.path.join(output_hr_base_path, img_filename) 
-            if not os.path.exists(src_lr) or not os.path.exists(src_hr):
-                print(f"Warning: Missing source LR ({src_lr}) or HR ({src_hr}) for {img_filename}. Skipping this pair for alignment.")
-                continue
-            try:
-                shutil.copy(src_lr, os.path.join(temp_batch_lr_input, img_filename))
-                shutil.copy(src_hr, os.path.join(temp_batch_hr_input, img_filename))
-                valid_images_for_this_batch.append(img_filename)
-            except Exception as e: print(f"Error copying {img_filename} for alignment batch: {e}. Skipping pair.")
-
-        if not valid_images_for_this_batch or not os.listdir(temp_batch_lr_input):
-             print(f"  No valid image pairs found or copied for {video_name}. Skipping alignment for this video.")
-             if os.path.exists(temp_batch_base): shutil.rmtree(temp_batch_base)
-             update_progress(progress_file, stage_name, video=video_name); continue
-
-        print(f"  Running ImgAlign for {video_name} batch ({len(valid_images_for_this_batch)} pairs)...")
-        img_align_cmd = ["ImgAlign", "-s", str(img_align_scale), "-m", "0", "-g", temp_batch_hr_input, "-l", temp_batch_lr_input, "-c", "-i", "-1", "-j", "-ai", "-o", temp_batch_aligned_output]
-        print(f"    ImgAlign Command: {' '.join(img_align_cmd)}")
-        try:
-            process = subprocess.Popen(img_align_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            stdout, stderr = process.communicate() 
-            if process.returncode != 0:
-                print(f"  Error running ImgAlign for {video_name}. Return Code: {process.returncode}\n    ImgAlign Stderr: {stderr.strip()}"); # Added strip()
-                if os.path.exists(temp_batch_base): shutil.rmtree(temp_batch_base)
-                update_progress(progress_file, stage_name, video=video_name); continue 
-            else: print(f"  ImgAlign completed successfully for {video_name}.")
-        except FileNotFoundError: print("  Error: ImgAlign command not found. Ensure it's in PATH."); shutil.rmtree(temp_batch_base); return 
-        except Exception as e: print(f"  Exception during ImgAlign execution for {video_name}: {e}"); shutil.rmtree(temp_batch_base); update_progress(progress_file, stage_name, video=video_name); continue
-
-        print(f"  Moving aligned files for {video_name}...")
-        imgalign_actual_output_subfolder = os.path.join(temp_batch_aligned_output, 'Output')
-        artifacts_filepath = os.path.join(imgalign_actual_output_subfolder, "Artifacts.txt") 
-        filenames_to_skip_due_to_artifacts = set() 
-        if os.path.exists(artifacts_filepath):
-             print(f"  Found Artifacts.txt for {video_name}. Will skip listed files.")
-             try:
-                 with open(artifacts_filepath, 'r') as f: filenames_to_skip_due_to_artifacts = {line.strip() for line in f if line.strip()}
-                 print(f"    Artifacts listed: {', '.join(filenames_to_skip_due_to_artifacts) if filenames_to_skip_due_to_artifacts else 'None'}")
-             except Exception as e: print(f"  Warning: Could not read Artifacts.txt: {e}")
-
-        moved_pair_count, skipped_artifact_set_count = 0, 0 
-        for folder_type in ['HR', 'LR', 'Overlay']: 
-            src_folder_path = os.path.join(imgalign_actual_output_subfolder, folder_type) 
-            dst_folder_path_map = {'HR': final_aligned_hr_path, 'LR': final_aligned_lr_path, 'Overlay': final_aligned_overlay_path} 
-            dst_target_folder = dst_folder_path_map[folder_type] 
-            if os.path.exists(src_folder_path):
-                for file_in_src in os.listdir(src_folder_path): 
-                    base_filename_no_ext, _ = os.path.splitext(file_in_src) 
-                    if base_filename_no_ext in filenames_to_skip_due_to_artifacts:
-                        if folder_type == 'LR': skipped_artifact_set_count += 1 
-                        continue 
-                    try: shutil.move(os.path.join(src_folder_path, file_in_src), os.path.join(dst_target_folder, file_in_src))
-                    except Exception as e: print(f"  Error moving aligned file {file_in_src}: {e}")
-                    if folder_type == 'LR': moved_pair_count += 1
-        print(f"  Moved {moved_pair_count} aligned pairs for {video_name}. Skipped {skipped_artifact_set_count} artifact-marked sets.")
-        print(f"  Cleaning up temporary batch folder for {video_name}."); shutil.rmtree(temp_batch_base)
-        update_progress(progress_file, stage_name, video=video_name)
-    update_progress(progress_file, stage_name, completed=True)
-    print("\n--- Image Alignment Process Completed ---")
-
-
-def filter_aligned_with_sisr(aligned_lr_input_folder_str, aligned_hr_input_folder_str,
-                             final_sisr_output_lr_folder_str, final_sisr_output_hr_folder_str,
-                             sisr_min_clip_distance, sisr_complexity_threshold, sisr_max_brightness,
-                             progress_file):
-    # ... (filter_aligned_with_sisr function - no changes from previous version) ...
-    global SISR_AVAILABLE
-    if not SISR_AVAILABLE:
-        print("SISR filtering stage skipped as SuperResImageSelector is not available.")
-        return
-
-    stage_name = 'sisr_filter'
-    progress = get_progress(progress_file)
-    if stage_name in progress and progress[stage_name].get('completed'):
-        print("SISR filtering already completed. Skipping...")
-        return
-
-    print(f"--- Starting SISR Filtering on Aligned Images ---")
-    print(f"  LR Input (Aligned): {aligned_lr_input_folder_str}")
-    print(f"  HR Input (Aligned): {aligned_hr_input_folder_str}")
-    print(f"  LR Output (SISR-Filtered): {final_sisr_output_lr_folder_str}")
-    print(f"  HR Output (SISR-Filtered): {final_sisr_output_hr_folder_str}")
-    print(f"  Config: Min CLIP Distance={sisr_min_clip_distance}, Complexity Threshold={sisr_complexity_threshold}, Max Brightness={sisr_max_brightness}")
-
-    aligned_lr_input_path = Path(aligned_lr_input_folder_str)
-    aligned_hr_input_path = Path(aligned_hr_input_folder_str)
-    final_sisr_output_lr_path = Path(final_sisr_output_lr_folder_str)
-    final_sisr_output_hr_path = Path(final_sisr_output_hr_folder_str)
-
-    os.makedirs(final_sisr_output_lr_path, exist_ok=True)
-    os.makedirs(final_sisr_output_hr_path, exist_ok=True)
-
-    if not aligned_lr_input_path.is_dir() or not os.listdir(aligned_lr_input_path):
-        print(f"Error: Aligned LR input folder '{aligned_lr_input_path}' is empty or not found. Cannot perform SISR filtering.")
-        update_progress(progress_file, stage_name, completed=True) 
+def filter_similar_images_phash(lr_matched: Path, hr_matched: Path, prog_file: Path):
+    """Filter similar images using perceptual hashing."""
+    global IMAGEHASH_AVAILABLE
+    if not IMAGEHASH_AVAILABLE:
+        print("Skip pHash: libs N/A.")
         return
     
-    selected_lr_paths_from_sisr = []
-    selector_instance = None # To ensure cleanup is called
+    if config.PHASH_SIMILARITY_THRESHOLD < 0:
+        print("Skip pHash: threshold < 0.")
+        return
+    
+    stage = 'filter_phash'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print("pHash filter done. Skip.")
+        return
+    
+    print(f"--- pHash Filter (Threshold: {config.PHASH_SIMILARITY_THRESHOLD}) ---")
+    if not lr_matched.is_dir() or not hr_matched.is_dir():
+        print("Error: Matched paths N/A for pHash.")
+        return
+    
     try:
-        print("Initializing SuperResImageSelector...")
-        # Pass None for output_folder to sisr_image_selector so it doesn't create its own default output
-        # It will still create its 'temp_...' dir for checkpoints.
-        selector_instance = SuperResImageSelector(input_folder=str(aligned_lr_input_path), output_folder=None) 
-        selector_instance.max_brightness = sisr_max_brightness
-
-        print("Running SISR selection logic on aligned LR images...")
-        selected_lr_paths_from_sisr = selector_instance.select_images(
-            min_distance=sisr_min_clip_distance,
-            complexity_threshold=sisr_complexity_threshold
-        )        
+        lr_imgs_all = sorted([f for f in lr_matched.iterdir() 
+                            if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')])
     except Exception as e:
-        print(f"Error during SISR selection process: {e}")
-        import traceback
-        traceback.print_exc()
-        return # Don't mark as completed on error
-    finally:
-        if selector_instance:
-            print("Cleaning up SISR temporary files...")
-            selector_instance.cleanup() 
-
-    if not selected_lr_paths_from_sisr:
-        print("SISR selector returned no images. No files will be copied for this stage.")
-        update_progress(progress_file, stage_name, completed=True)
+        print(f"Error listing for pHash: {e}")
+        return
+    
+    if not lr_imgs_all:
+        print("No images for pHash.")
+        update_progress(prog_file, stage, completed=True)
         return
 
-    print(f"SISR selector identified {len(selected_lr_paths_from_sisr)} LR images. Copying selected LR/HR pairs...")
-    copied_pair_count = 0
-    for lr_selected_path_obj in tqdm(selected_lr_paths_from_sisr, desc="Copying SISR selected pairs"):
-        lr_filename = lr_selected_path_obj.name
-        hr_corresponding_path = aligned_hr_input_path / lr_filename
-
-        if not hr_corresponding_path.exists():
-            print(f"Warning: Corresponding aligned HR file not found for {lr_selected_path_obj} at {hr_corresponding_path}. Skipping this pair.")
+    groups = defaultdict(list)
+    re_fname = re.compile(r"^(.*?)_frame_\d+\.png$")
+    for p in lr_imgs_all:
+        m = re_fname.match(p.name)
+        groups[m.group(1) if m else 'unknown_video_group'].append(p)
+    
+    tot_rem = 0
+    processed = prog_data.get(stage, {}).get('items', [])
+    
+    for vid_name, paths in tqdm(groups.items(), desc="pHash by video"):
+        if vid_name == 'unknown_video_group' or vid_name in processed:
             continue
-        try:
-            shutil.copy2(lr_selected_path_obj, final_sisr_output_lr_path / lr_filename)
-            shutil.copy2(hr_corresponding_path, final_sisr_output_hr_path / lr_filename)
-            copied_pair_count += 1
-        except Exception as e:
-            print(f"Error copying SISR-selected pair {lr_filename}: {e}")
+        
+        kept_hashes = {}
+        to_rem_stems = set()
+        paths.sort()
+        
+        for lr_p in tqdm(paths, desc=f"Hashing {vid_name}", leave=False):
+            hr_p = hr_matched / lr_p.name
+            if not hr_p.exists():
+                continue
+            
+            try:
+                size = lr_p.stat().st_size
+                with Image.open(lr_p) as pil_img:
+                    cur_hash = imagehash.phash(pil_img)
+            except Exception:
+                continue
+            
+            is_sim = False
+            for khash in list(kept_hashes.keys()):
+                kpath, ksize = kept_hashes[khash]
+                if (cur_hash - khash) < config.PHASH_SIMILARITY_THRESHOLD:
+                    if size >= ksize:
+                        to_rem_stems.add(kpath.stem)
+                        del kept_hashes[khash]
+                        kept_hashes[cur_hash] = (lr_p, size)
+                    else:
+                        to_rem_stems.add(lr_p.stem)
+                    is_sim = True
+                    break
+            
+            if not is_sim:
+                kept_hashes[cur_hash] = (lr_p, size)
+        
+        rem_grp = 0
+        for stem_rem in to_rem_stems:
+            try:
+                if (f_lr := lr_matched / f"{stem_rem}.png").exists():
+                    f_lr.unlink()
+                if (f_hr := hr_matched / f"{stem_rem}.png").exists():
+                    f_hr.unlink()
+                rem_grp += 1
+            except OSError:
+                pass
+        
+        if rem_grp > 0:
+            print(f"pHash ({vid_name}): Removed {rem_grp} pairs.")
+        tot_rem += rem_grp
+        update_progress(prog_file, stage, item=vid_name)
+    
+    print(f"pHash filter done. Total removed: {tot_rem}.")
+    update_progress(prog_file, stage, completed=True)
 
-    print(f"Successfully copied {copied_pair_count} SISR-filtered image pairs.")
-    update_progress(progress_file, stage_name, completed=True)
-    print(f"--- SISR Filtering Finished ---")
+def align_images(lr_matched: Path, hr_matched: Path, aligned_base: Path, prog_file: Path):
+    """Align image pairs using ImgAlign tool."""
+    stage = 'align'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print("Alignment done. Skip.")
+        return
+    
+    imgalign_exe = shutil.which("ImgAlign")
+    if not imgalign_exe:
+        print("Error: ImgAlign N/A. Skip align.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    if aligned_base.exists():
+        shutil.rmtree(aligned_base)
+    aligned_base.mkdir(parents=True)
+    
+    if not lr_matched.is_dir():
+        print(f"LR matched path N/A: {lr_matched}")
+        return
+    
+    imgs_to_align = sorted([f for f in lr_matched.iterdir() 
+                           if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')])
+    if not imgs_to_align:
+        print("No images to align.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    print(f"Aligning {len(imgs_to_align)} pairs...")
+    groups = defaultdict(list)
+    re_fname = re.compile(r"^(.*?)_frame_\d+\.png$")
+    
+    for p in imgs_to_align:
+        m = re_fname.match(p.name)
+        groups[m.group(1) if m else 'unknown_align_group'].append(p)
+    
+    processed = prog_data.get(stage, {}).get('items', [])
+    final_lr = aligned_base / "LR"
+    final_hr = aligned_base / "HR"
+    final_ov = aligned_base / "Overlay"
+    final_lr.mkdir()
+    final_hr.mkdir()
+    final_ov.mkdir()
+
+    for vid_name, paths in tqdm(groups.items(), desc="Aligning videos"):
+        if vid_name == 'unknown_align_group' or vid_name in processed:
+            continue
+        
+        print(f"\nAligning group: {vid_name}...")
+        tmp_base = aligned_base / f"__temp_{vid_name}"
+        shutil.rmtree(tmp_base, ignore_errors=True)
+        
+        tmp_lr = tmp_base / "lr_in"
+        tmp_hr = tmp_base / "hr_in"
+        tmp_out = tmp_base / "aligned_out"
+        tmp_lr.mkdir(parents=True)
+        tmp_hr.mkdir(parents=True)
+        tmp_out.mkdir(parents=True)
+        
+        valid_batch = []
+        for lr_p_src in tqdm(paths, desc=f"Prep batch {vid_name}", leave=False):
+            hr_p_src = hr_matched / lr_p_src.name
+            if hr_p_src.exists():
+                try:
+                    shutil.copy2(lr_p_src, tmp_lr / lr_p_src.name)
+                    shutil.copy2(hr_p_src, tmp_hr / lr_p_src.name)
+                    valid_batch.append(lr_p_src.name)
+                except:
+                    pass
+        
+        if not valid_batch:
+            print(f"No valid pairs for {vid_name}. Skip batch.")
+            shutil.rmtree(tmp_base)
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+
+        # CORRECTED COMMAND - Based on working backup
+        cmd = [
+            imgalign_exe,
+            "-s", str(config.IMG_ALIGN_SCALE),  # Scale factor
+            "-m", "0",                          # Mode (0 = automatic)
+            "-g", str(tmp_hr),                  # Ground truth (HR) folder
+            "-l", str(tmp_lr),                  # Low resolution folder  
+            "-c",                               # Create subfolders
+            "-i", "-1",                         # Iterations (-1 for auto)
+            "-j",                               # Use JPEG for overlay
+            "-ai",                              # Auto-increment naming
+            "-o", str(tmp_out)                  # Output folder (at end)
+        ]
+        
+        print(f"ImgAlign cmd: {' '.join(cmd)}")
+        
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, check=True)
+            if proc.stderr:
+                print(f"ImgAlign ({vid_name}) warnings/info:\n{proc.stderr.strip()[-500:]}")
+            if proc.stdout:
+                print(f"ImgAlign ({vid_name}) output:\n{proc.stdout.strip()[-500:]}")
+        except subprocess.CalledProcessError as e:
+            print(f"ImgAlign ({vid_name}) failed with return code {e.returncode}")
+            print(f"Command: {' '.join(cmd)}")
+            print(f"Stdout: {e.stdout}")
+            print(f"Stderr: {e.stderr}")
+            shutil.rmtree(tmp_base)
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+        except subprocess.TimeoutExpired:
+            print(f"ImgAlign ({vid_name}) timed out after 1 hour")
+            shutil.rmtree(tmp_base)
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+        except Exception as e:
+            print(f"ImgAlign ({vid_name}) error: {e}")
+            shutil.rmtree(tmp_base)
+            update_progress(prog_file, stage, item=vid_name)
+            continue
+        
+        # Process the output
+        out_sub = tmp_out / "Output"
+        artifacts = set()
+        
+        if (art_f := out_sub / "Artifacts.txt").exists():
+            try:
+                artifacts = {Path(l.strip()).stem for l in art_f.read_text().splitlines() if l.strip()}
+            except:
+                print(f"Warn: Could not read {art_f}")
+        
+        moved, skipped = 0, 0
+        for ftype, dest_path in [('HR', final_hr), ('LR', final_lr), ('Overlay', final_ov)]:
+            src_fld = out_sub / ftype
+            if src_fld.is_dir():
+                for f_src in src_fld.iterdir():
+                    if f_src.is_file():
+                        if f_src.stem in artifacts:
+                            if ftype == 'LR':
+                                skipped += 1
+                                continue
+                        try:
+                            shutil.move(str(f_src), str(dest_path / f_src.name))
+                            if ftype == 'LR':
+                                moved += 1
+                        except Exception as e:
+                            print(f"Error moving {f_src.name}: {e}")
+        
+        print(f"Moved {moved} aligned pairs for {vid_name}. Skipped {skipped} artifacts.")
+        shutil.rmtree(tmp_base)
+        update_progress(prog_file, stage, item=vid_name)
+    
+    update_progress(prog_file, stage, completed=True)
+    print("\n--- Image Alignment Done ---")
+
+def filter_aligned_with_sisr(lr_aligned: Path, hr_aligned: Path, lr_sisr_out: Path, hr_sisr_out: Path, prog_file: Path):
+    """Filter aligned images using SISR selection."""
+    global SISR_AVAILABLE
+    if not SISR_AVAILABLE:
+        print("SISR N/A (libs). Skip.")
+        return
+    
+    stage = 'sisr_filter'
+    prog_data = get_progress(prog_file)
+    if prog_data.get(stage, {}).get('completed', False):
+        print("SISR filter done. Skip.")
+        return
+    
+    print(f"--- SISR Filter (CLIP Dist: {config.SISR_MIN_CLIP_DISTANCE}, Complexity: {config.SISR_COMPLEXITY_THRESHOLD}, Brightness: {config.SISR_MAX_BRIGHTNESS}) ---")
+    lr_sisr_out.mkdir(parents=True, exist_ok=True)
+    hr_sisr_out.mkdir(parents=True, exist_ok=True)
+    
+    if not lr_aligned.is_dir() or not any(lr_aligned.iterdir()):
+        print(f"Error: Aligned LR folder '{lr_aligned}' empty/N/A.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    selected_paths, selector = [], None
+    try:
+        selector = SuperResImageSelector(str(lr_aligned), None, config.SISR_MAX_BRIGHTNESS)
+        selected_paths = selector.select_images(config.SISR_MIN_CLIP_DISTANCE, config.SISR_COMPLEXITY_THRESHOLD)
+    except Exception as e:
+        print(f"Error in SISR selection: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if selector:
+            selector.cleanup()
+    
+    if not selected_paths:
+        print("SISR returned no images.")
+        update_progress(prog_file, stage, completed=True)
+        return
+    
+    print(f"SISR selected {len(selected_paths)} LR images. Copying pairs...")
+    copied = 0
+    
+    for lr_sel_path in tqdm(selected_paths, desc="Copying SISR pairs"):
+        hr_corr_path = hr_aligned / lr_sel_path.name
+        if not hr_corr_path.exists():
+            print(f"Warn: HR for {lr_sel_path.name} N/A. Skip.")
+            continue
+        
+        try:
+            shutil.copy2(lr_sel_path, lr_sisr_out / lr_sel_path.name)
+            shutil.copy2(hr_corr_path, hr_sisr_out / lr_sel_path.name)
+            copied += 1
+        except Exception as e:
+            print(f"Error copying SISR pair {lr_sel_path.name}: {e}")
+    
+    print(f"Copied {copied} SISR-filtered pairs.")
+    update_progress(prog_file, stage, completed=True)
+    print("--- SISR Filtering Finished ---")
 
 
 if __name__ == "__main__":
-    # --- Configuration Options ---
+    t_start = time.time()
+    
+    # Initialize FFmpeg/FFprobe paths
+    FFMPEG_PATH = _find_executable("ffmpeg", config.FFMPEG_PATH)
+    FFPROBE_PATH = _find_executable("ffprobe", config.FFPROBE_PATH)
+    
+    if not FFMPEG_PATH or not FFPROBE_PATH:
+        print("FATAL: ffmpeg/ffprobe N/A.")
+        exit(1)
 
-    # Input/Output Paths
-    lr_input_video_folder = "E:\\MyFolder\\LR"  # Path to the folder containing Low-Resolution videos
-    hr_input_video_folder = "E:\\MyFolder\\HR" # Path to the folder containing High-Resolution videos
-    output_base_folder = "E:\\MyFolder\\Output" # Base directory where all processed files will be saved
+    # Setup paths
+    lr_in = Path(config.LR_INPUT_VIDEO_FOLDER)
+    hr_in = Path(config.HR_INPUT_VIDEO_FOLDER)
+    out_base = Path(config.OUTPUT_BASE_FOLDER)
+    out_base.mkdir(parents=True, exist_ok=True)
+    
+    extracted_fld = out_base / config.EXTRACTED_SUBFOLDER_NAME
+    matched_fld = out_base / config.MATCHED_SUBFOLDER_NAME
+    aligned_fld = out_base / config.ALIGNED_SUBFOLDER_NAME
+    sisr_fld = out_base / config.SISR_FILTERED_SUBFOLDER_NAME
+    prog_f = out_base / config.PROGRESS_FILENAME
+    
+    lr_matched_out, hr_matched_out = matched_fld / "LR", matched_fld / "HR"
+    
+    # Create necessary directories
+    extracted_fld.mkdir(exist_ok=True)
+    matched_fld.mkdir(exist_ok=True)
+    lr_matched_out.mkdir(exist_ok=True)
+    hr_matched_out.mkdir(exist_ok=True)
+    
+    if config.ENABLE_SISR_FILTERING:
+        sisr_fld.mkdir(exist_ok=True)
 
-    # Frame Extraction & Preprocessing
-    begin_time = "00:00:00"  # Start time for frame extraction "HH:MM:SS" (00:00:00 for beginning of video)
-    end_time = "00:00:00"    # End time for frame extraction "HH:MM:SS" (00:00:00 for end of video, processes whole video if both are 00:00:00)
-    scene_threshold = 0.23   # Scene change detection sensitivity for FFmpeg (0.0 to 1.0).
-                            # Lower values are more sensitive, extracting more frames near scene changes.
-    lr_width, lr_height = None, None # Target width and height for LR frames. Set to None to keep original dimensions.
-                                     # If both are set, frames will be resized to these exact dimensions.
-    lr_scale = None          # Alternatively, set a scale factor for LR frames (e.g., 0.5 for half size).
-                             # This overrides lr_width/lr_height if set. None to disable scaling.
-    hr_width, hr_height = None, None # Target width and height for HR frames. Set to None to keep original.
-    hr_scale = None          # Alternatively, set a scale factor for HR frames. Overrides hr_width/hr_height.
+    # Print configuration summary
+    print_configs = [
+        ("LR Input", lr_in),
+        ("HR Input", hr_in),
+        ("Output Base", out_base),
+        ("Deinterlace Mode", config.DEINTERLACE_MODE),
+        ("Autocrop", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"),
+        ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"),
+        ("Match Thresh", config.MATCH_THRESHOLD),
+        ("Initial Win %", config.INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE),
+        ("Subsequent Win (s)", config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS),
+        ("Fallback Win (s)", config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS),
+        ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD),
+        ("ImgAlign Scale", config.IMG_ALIGN_SCALE),
+        ("SISR Filtering", config.ENABLE_SISR_FILTERING)
+    ]
+    
+    print("--- Pipeline Configuration ---")
+    for k, v in print_configs:
+        print(f"{k}: {v}")
+    
+    if config.ENABLE_SISR_FILTERING and not SISR_AVAILABLE:
+        print("  WARNING: SISR N/A (libs). Will be skipped.")
+    elif config.ENABLE_SISR_FILTERING:
+        print(f"  SISR: CLIP Dist={config.SISR_MIN_CLIP_DISTANCE}, Complexity={config.SISR_COMPLEXITY_THRESHOLD}, Brightness={config.SISR_MAX_BRIGHTNESS}")
 
-    # Deinterlacing Options
-    # Determines if and how deinterlacing is applied during frame extraction.
-    # Options:
-    #   'none': No deinterlacing.
-    #   'lr': Deinterlace only LR videos.
-    #   'hr': Deinterlace only HR videos.
-    #   'both': Deinterlace both LR and HR videos.
-    #   'auto': Attempt to auto-detect interlacing for each video and deinterlace if detected.
-    DEINTERLACE_MODE = 'none' # Options: 'none', 'lr', 'hr', 'both', 'auto'
-    # FFmpeg filter string for deinterlacing.
-    # 'bwdif' (Bob Weaver Deinterlacing Filter) is generally good quality.
-    # 'yadif' (Yet Another Deinterlacing Filter) is faster but may have lower quality.
-    # Add options like ':mode=send_frame:parity=auto' as needed by the filter.
-    DEINTERLACE_FILTER = 'bwdif=mode=send_frame:parity=auto' # Example: High quality bwdif options
-
-    # Autocropping Configuration
-    CROP_BLACK_BORDERS = True  # Set to True to enable automatic black border cropping after frame extraction.
-    CROP_BLACK_THRESHOLD = 15   # Pixel intensity threshold (0-255). Pixels with grayscale intensity
-                                # below this value are considered part of a black border.
-    CROP_MIN_CONTENT_DIMENSION = 300 # Minimum width or height (in pixels) of the detected content area
-                                    # after potential cropping. If the content is smaller than this,
-                                    # the crop is skipped for that image to prevent overly aggressive cropping.
-
-    # --- NEW: Low Information Filter Configuration (Pre-Match) ---
-    ENABLE_LOW_INFO_FILTER = True # Set to True to enable filtering of low variance images before matching
-    LOW_INFO_VARIANCE_THRESHOLD = 100 # Grayscale pixel intensity variance threshold. Images below this are removed.
-                                     # Pure black/white is 0. Tune this value based on your content. Start with 50-200.
-    LOW_INFO_CHECK_HR_TOO = False   # If True, also check the HR image for low variance. If either LR or HR (if checked)
-                                   # is below threshold, the pair is removed.
-
-    # Frame Matching (Template Matching)
-    match_threshold = 0.3   # Threshold for template matching (cv2.TM_SQDIFF_NORMED).
-                            # Lower values mean a stricter (better) match. Range is typically 0.0 (perfect) to 1.0.
-    resize_height = 540     # Internal height to which frames are resized *before* template matching for consistency.
-                            # Adjust based on typical input video aspect ratios for optimal comparison. (e.g., 480, 540, 720)
-    resize_width = int(resize_height * (4/3)) # Internal width for resizing before template matching.
-                                              # Common aspect ratios: (16/9) or (4/3). Adjust as needed.
-    distance_modifier = 0.75 # (Currently unused in process_image_pair, can be removed or repurposed)
-
-    # Similarity Filtering (Perceptual Hash - Post-Match, Pre-Align)
-    # After matching, this step removes image pairs where the LR images are too similar to each other
-    # (e.g., consecutive frames with very little change).
-    similarity_threshold = 4 # Perceptual hash (phash) difference threshold.
-                             # Lower values mean images must be *more* similar to be considered duplicates and removed.
-                             # A common starting point is 4-6. Higher values remove fewer images.
-
-    # Image Alignment (Requires ImgAlign tool: https://github.com/NicholasGU/ImgAlign)
-    # This step attempts to spatially align the matched LR and HR image pairs.
-    img_align_scale = 2     # The integer scale factor between LR and HR images (e.g., 2 if HR is 2x LR resolution).
-                            # ImgAlign uses this to help with the alignment process.
-                            # If LR and HR are the same resolution after extraction/scaling for ImgAlign, set to 1.
-                            # This depends on the resolutions of images *fed into ImgAlign*.
-
-    # SISR Filtering (Post-Align)
-    ENABLE_SISR_FILTERING = True # Set to True to run this stage using SuperResImageSelector
-    SISR_MIN_CLIP_DISTANCE = 0.10  # Minimum CLIP distance for SISR selector (0.0-1.0, higher is more distinct)
-    SISR_COMPLEXITY_THRESHOLD = 0.3 # Minimum complexity score for SISR selector (adjust based on results)
-    SISR_MAX_BRIGHTNESS = 220     # Max average brightness (0-255) for SISR selector
-
-    # --- Derived Paths & Progress File ---
-    # Numbered prefixes help see the pipeline flow in the filesystem
-    extracted_images_folder = os.path.join(output_base_folder, "1_EXTRACTED")
-    # Low info filter modifies EXTRACTED in-place, so no new folder number.
-    matched_base_folder = os.path.join(output_base_folder, "2_MATCHED")
-    # pHash filter modifies MATCHED in-place.
-    aligned_output_base_path = os.path.join(output_base_folder, "3_ALIGNED")
-    sisr_filtered_base_folder = os.path.join(output_base_folder, "4_SISR_FILTERED")
-    progress_file = os.path.join(output_base_folder, "progress.json")
-
-    # --- Dynamic Output Paths (within main stages for clarity) ---
-    output_lr_base_path = os.path.join(matched_base_folder, "LR") # For stage 2 output
-    output_hr_base_path = os.path.join(matched_base_folder, "HR") # For stage 2 output
-
-    # --- Create Base Output Directories ---
-    os.makedirs(extracted_images_folder, exist_ok=True) # For LR and HR subfolders
-    os.makedirs(matched_base_folder, exist_ok=True)   # For LR and HR subfolders
-    # align_images creates its own base folder (aligned_output_base_path)
-    if ENABLE_SISR_FILTERING:
-        os.makedirs(sisr_filtered_base_folder, exist_ok=True) # For LR and HR subfolders
-
-    print("--- Starting Image Pairing Pipeline ---")
-    print(f"Progress file: {progress_file}")
-    # Print key configurations
-    print(f"Deinterlace Mode: {DEINTERLACE_MODE}")
-    if DEINTERLACE_MODE != 'none': print(f"  Deinterlace Filter: {DEINTERLACE_FILTER}")
-    print(f"Autocrop Black Borders: {CROP_BLACK_BORDERS}")
-    if CROP_BLACK_BORDERS: print(f"  Crop Black Threshold: {CROP_BLACK_THRESHOLD}, Min Content Dimension: {CROP_MIN_CONTENT_DIMENSION}")
-    print(f"Low Information Filter: {ENABLE_LOW_INFO_FILTER}")
-    if ENABLE_LOW_INFO_FILTER: print(f"  Low Info Variance Threshold: {LOW_INFO_VARIANCE_THRESHOLD}, Check HR Too: {LOW_INFO_CHECK_HR_TOO}")
-    print(f"SISR Filtering: {ENABLE_SISR_FILTERING}")
-    if ENABLE_SISR_FILTERING and not SISR_AVAILABLE:
-        print("  WARNING: SISR_AVAILABLE is False. SISR filtering stage will be skipped despite being enabled.")
-    elif ENABLE_SISR_FILTERING:
-        print(f"  SISR Config: Min CLIP Dist={SISR_MIN_CLIP_DISTANCE}, Complexity Thresh={SISR_COMPLEXITY_THRESHOLD}, Max Brightness={SISR_MAX_BRIGHTNESS}")
-
-
-    # --- Pipeline Stages ---
-    print("\n=== Stage 1: Preprocessing Videos (Frame Extraction) ===")
-    lr_extracted_path, hr_extracted_path = preprocess_videos(
-        lr_input_folder=lr_input_video_folder, hr_input_folder=hr_input_video_folder,
-        extracted_images_folder=extracted_images_folder, begin_time=begin_time, end_time=end_time,
-        scene_threshold=scene_threshold, lr_width=lr_width, lr_height=lr_height, lr_scale=lr_scale,
-        hr_width=hr_width, hr_height=hr_height, hr_scale=hr_scale,
-        deinterlace_mode=DEINTERLACE_MODE, deinterlace_filter=DEINTERLACE_FILTER,
-        progress_file=progress_file
-    )
-
-    if CROP_BLACK_BORDERS:
-        print("\n=== Stage 1.5: Autocropping Black Borders ===")
-        if lr_extracted_path and os.path.isdir(lr_extracted_path):
-            autocrop_frames_in_folders(lr_extracted_path, CROP_BLACK_THRESHOLD, CROP_MIN_CONTENT_DIMENSION, progress_file, "_LR")
-        else: print(f"Skipping LR autocropping: Path '{lr_extracted_path}' not valid or empty.")
-        if hr_extracted_path and os.path.isdir(hr_extracted_path):
-            autocrop_frames_in_folders(hr_extracted_path, CROP_BLACK_THRESHOLD, CROP_MIN_CONTENT_DIMENSION, progress_file, "_HR")
-        else: print(f"Skipping HR autocropping: Path '{hr_extracted_path}' not valid or empty.")
-    else: print("\n=== Skipping Stage 1.5: Autocropping Black Borders (disabled) ===")
-
-    # --- NEW STAGE ---
-    if ENABLE_LOW_INFO_FILTER:
-        print("\n=== Stage 1.7: Filtering Low Information Images (Pre-Match) ===")
-        # This filter operates on the output of Stage 1 (and 1.5 if enabled), i.e., lr_extracted_path / hr_extracted_path
-        filter_low_information_images(
-            base_lr_path_str=lr_extracted_path,
-            base_hr_path_str=hr_extracted_path,
-            variance_threshold=LOW_INFO_VARIANCE_THRESHOLD,
-            check_hr_too=LOW_INFO_CHECK_HR_TOO,
-            progress_file=progress_file
-        )
+    # ===== PIPELINE EXECUTION =====
+    
+    print("\n=== Stage 1: Preprocessing (Extract & Timestamp) ===")
+    lr_ext_base, hr_ext_base = preprocess_videos(lr_in, hr_in, extracted_fld, prog_f)
+    
+    # Optional: Autocrop black borders
+    if config.CROP_BLACK_BORDERS:
+        autocrop_frames_in_folders(lr_ext_base, prog_f, "_LR")
+        autocrop_frames_in_folders(hr_ext_base, prog_f, "_HR")
     else:
-        print("\n=== Skipping Stage 1.7: Filtering Low Information Images (disabled) ===")
-
-
-    print("\n=== Stage 2: Matching Frame Pairs (Template Matching) ===")
-    # Ensure the output paths for matching are created before calling
-    os.makedirs(output_lr_base_path, exist_ok=True)
-    os.makedirs(output_hr_base_path, exist_ok=True)
-    process_folder_pair(
-        lr_base_path=lr_extracted_path, hr_base_path=hr_extracted_path, # Input from extraction (potentially filtered by low_info)
-        output_lr_base_path=output_lr_base_path, output_hr_base_path=output_hr_base_path, # Output to MATCHED/LR and MATCHED/HR
-        match_threshold=match_threshold, resize_height=resize_height, resize_width=resize_width,
-        distance_modifier=distance_modifier, progress_file=progress_file
-    )
-
-    print("\n=== Stage 3: Filtering Similar Images (Perceptual Hash) ===")
-    filter_similar_images(
-        matched_lr_path=output_lr_base_path, matched_hr_path=output_hr_base_path, # Input from Stage 2
-        similarity_threshold=similarity_threshold, progress_file=progress_file
-    )
-
-    print("\n=== Stage 4: Aligning Images (using ImgAlign) ===")
-    align_images(
-        output_lr_base_path=output_lr_base_path, output_hr_base_path=output_hr_base_path, # Input from Stage 3 (phash filtered)
-        aligned_output_base_path=aligned_output_base_path, # Output to ALIGNED base
-        img_align_scale=img_align_scale,
-        progress_file=progress_file
-    )
-
-    if ENABLE_SISR_FILTERING and SISR_AVAILABLE:
-        print("\n=== Stage 5: Filtering Aligned Images with SISR Selector ===")
-        sisr_input_lr_aligned = os.path.join(aligned_output_base_path, "LR") # Input LR from Stage 4
-        sisr_input_hr_aligned = os.path.join(aligned_output_base_path, "HR") # Input HR from Stage 4
-        
-        # Ensure the base output folder for SISR exists before defining LR/HR subpaths
-        os.makedirs(sisr_filtered_base_folder, exist_ok=True)
-        sisr_final_output_lr = os.path.join(sisr_filtered_base_folder, "LR")
-        sisr_final_output_hr = os.path.join(sisr_filtered_base_folder, "HR")
-        os.makedirs(sisr_final_output_lr, exist_ok=True) # Ensure specific LR/HR output dirs exist
-        os.makedirs(sisr_final_output_hr, exist_ok=True)
-
-
-        filter_aligned_with_sisr(
-            aligned_lr_input_folder_str=sisr_input_lr_aligned,
-            aligned_hr_input_folder_str=sisr_input_hr_aligned,
-            final_sisr_output_lr_folder_str=sisr_final_output_lr,
-            final_sisr_output_hr_folder_str=sisr_final_output_hr,
-            sisr_min_clip_distance=SISR_MIN_CLIP_DISTANCE,
-            sisr_complexity_threshold=SISR_COMPLEXITY_THRESHOLD,
-            sisr_max_brightness=SISR_MAX_BRIGHTNESS,
-            progress_file=progress_file
-        )
-    elif ENABLE_SISR_FILTERING and not SISR_AVAILABLE:
-        print("\n=== Skipping Stage 5: SISR Filtering (SuperResImageSelector not available) ===")
+        print("\nSkipping Autocrop (disabled).")
+    
+    # Optional: Filter low information images
+    if config.ENABLE_LOW_INFO_FILTER:
+        filter_low_information_images(lr_ext_base, hr_ext_base, prog_f)
     else:
-        print("\n=== Skipping Stage 5: SISR Filtering (disabled by configuration) ===")
+        print("\nSkipping Low Info Filter (disabled).")
 
+    print("\n=== Stage 2: Matching (Windowed & Temporal Filter) ===")
+    process_folder_pair(lr_ext_base, hr_ext_base, lr_matched_out, hr_matched_out, prog_f)
 
-    print("\n--- Image Processing and Alignment Pipeline Completed ---")
+    # Optional: pHash similarity filtering
+    if config.PHASH_SIMILARITY_THRESHOLD >= 0:
+        print("\n=== Stage 3: pHash Similarity Filter ===")
+        filter_similar_images_phash(lr_matched_out, hr_matched_out, prog_f)
+    else:
+        print("\nSkipping pHash Filter (disabled).")
 
-# --- END OF MODIFIED FILE ---
+    print("\n=== Stage 4: Aligning (ImgAlign) ===")
+    align_images(lr_matched_out, hr_matched_out, aligned_fld, prog_f)
+
+    # Optional: SISR filtering
+    if config.ENABLE_SISR_FILTERING and SISR_AVAILABLE:
+        print("\n=== Stage 5: SISR Filtering ===")
+        lr_aligned_in, hr_aligned_in = aligned_fld / "LR", aligned_fld / "HR"
+        lr_sisr_final, hr_sisr_final = sisr_fld / "LR", sisr_fld / "HR"
+        filter_aligned_with_sisr(lr_aligned_in, hr_aligned_in, lr_sisr_final, hr_sisr_final, prog_f)
+    elif config.ENABLE_SISR_FILTERING and not SISR_AVAILABLE:
+        print("\nSkipping SISR (libs N/A).")
+    else:
+        print("\nSkipping SISR (disabled).")
+
+    total_time = time.time() - t_start
+    print(f"\n--- Pipeline Finished --- Total Time: {total_time:.2f}s ---")
+    
+    # Print final summary
+    print("\n=== Final Output Summary ===")
+    
+    if lr_matched_out.exists():
+        matched_count = len(list(lr_matched_out.glob("*.png")))
+        print(f"Matched pairs: {matched_count}")
+    
+    if (aligned_fld / "LR").exists():
+        aligned_count = len(list((aligned_fld / "LR").glob("*.png")))
+        print(f"Aligned pairs: {aligned_count}")
+    
+    if config.ENABLE_SISR_FILTERING and (sisr_fld / "LR").exists():
+        sisr_count = len(list((sisr_fld / "LR").glob("*.png")))
+        print(f"SISR filtered pairs: {sisr_count}")
+    
+    print(f"\nOutput directory: {out_base}")
+    print("Pipeline completed successfully!")
