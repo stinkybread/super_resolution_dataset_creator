@@ -447,8 +447,7 @@ def detect_interlacing(video_path: Path, probe_duration: int = 10) -> bool:
         return False
 
 def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str, end_time: str,
-                         scene_threshold: float, width: int | None, height: int | None,
-                         scale: float | None, video_type: str, deinterlace_mode: str,
+                         scene_threshold: float, video_type: str, deinterlace_mode: str,
                          deinterlace_filter: str):
     """Extract frames using FFmpeg with optional deinterlacing, chroma upsampling, and HDR tone mapping."""
     global FFMPEG_PATH
@@ -483,11 +482,6 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
         print(f"Applying HDR tone mapping to {video_path.name}")
 
     vf.append(f"select='gt(scene,{scene_threshold})',showinfo")
-
-    if width and height:
-        vf.append(f"scale={width}:{height}")
-    elif scale:
-        vf.append(f"scale=iw*{scale}:ih*{scale}")
 
     cmd.extend([
         "-vf", ",".join(vf), "-vsync", "vfr", "-q:v", "2",
@@ -580,7 +574,7 @@ def preprocess_videos(lr_input_folder: Path, hr_input_folder: Path, extracted_im
         print(f"\n--- Processing {lr_path.name} (LR) & {hr_path.name} (HR) ---")
         lr_out = lr_base / name_stem
         print(f"Extracting LR for {lr_path.name}...")
-        lr_ok, lr_f, lr_ts, lr_dur = extract_frames_ffmpeg(lr_path, lr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD, config.LR_WIDTH, config.LR_HEIGHT, config.LR_SCALE, 'lr', config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER)
+        lr_ok, lr_f, lr_ts, lr_dur = extract_frames_ffmpeg(lr_path, lr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD, 'lr', config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER)
 
         if lr_ok and lr_f and lr_ts:
             with (lr_out / config.METADATA_FILENAME).open('w') as f:
@@ -592,7 +586,7 @@ def preprocess_videos(lr_input_folder: Path, hr_input_folder: Path, extracted_im
 
         hr_out = hr_base / name_stem
         print(f"Extracting HR for {hr_path.name}...")
-        hr_ok, hr_f, hr_ts, hr_dur = extract_frames_ffmpeg(hr_path, hr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD, config.HR_WIDTH, config.HR_HEIGHT, config.HR_SCALE, 'hr', config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER)
+        hr_ok, hr_f, hr_ts, hr_dur = extract_frames_ffmpeg(hr_path, hr_out, config.BEGIN_TIME, config.END_TIME, config.SCENE_THRESHOLD, 'hr', config.DEINTERLACE_MODE, config.DEINTERLACE_FILTER)
 
         if hr_ok and hr_f and hr_ts:
             with (hr_out / config.METADATA_FILENAME).open('w') as f:
@@ -603,8 +597,42 @@ def preprocess_videos(lr_input_folder: Path, hr_input_folder: Path, extracted_im
     print("--- Preprocessing Finished ---")
     return lr_base, hr_base
 
-def fix_pan_and_scan_pair(lr_path: Path, hr_path: Path):
-    """Compares a widescreen and fullscreen image. Crops the widescreen version to match the content of the fullscreen version."""
+def _find_template_in_container(container_gray, content_gray):
+    """
+    Helper function to find a smaller 'content' image within a larger 'container' image.
+    Returns the match score and the top-left location of the match.
+    Optimized for performance by downscaling very large container images.
+    """
+    h_cont, w_cont = container_gray.shape
+    h_contn, w_contn = content_gray.shape
+
+    if w_cont < w_contn or h_cont < h_contn:
+        return 0.0, None
+
+    # If the container is large (e.g., >1920px wide), scale it down for faster matching.
+    max_width = 1920.0
+    if w_cont > max_width:
+        scale = max_width / w_cont
+        container_scaled = cv2.resize(container_gray, (int(w_cont * scale), int(h_cont * scale)), cv2.INTER_AREA)
+        content_scaled = cv2.resize(content_gray, (int(w_contn * scale), int(h_contn * scale)), cv2.INTER_AREA)
+    else:
+        scale = 1.0
+        container_scaled = container_gray
+        content_scaled = content_gray
+
+    result = cv2.matchTemplate(container_scaled, content_scaled, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc_scaled = cv2.minMaxLoc(result)
+
+    # Convert location back to original container coordinates if we scaled down.
+    original_loc = (int(max_loc_scaled[0] / scale), int(max_loc_scaled[1] / scale)) if scale < 1.0 else max_loc_scaled
+    return max_val, original_loc
+
+def fix_mismatched_content_pair(lr_path: Path, hr_path: Path):
+    """
+    Compares an LR/HR pair and crops the 'container' image to match the 'content'.
+    Handles both pan-and-scan (e.g., 4:3 content in a 16:9 frame) and open-matte
+    (e.g., 16:9 content in a 4:3 frame) by running a "contest".
+    """
     try:
         lr_img = cv2.imread(str(lr_path))
         hr_img = cv2.imread(str(hr_path))
@@ -612,47 +640,60 @@ def fix_pan_and_scan_pair(lr_path: Path, hr_path: Path):
 
         h_lr, w_lr = lr_img.shape[:2]
         h_hr, w_hr = hr_img.shape[:2]
-        if h_lr == 0 or h_hr == 0: return False
 
-        ar_lr = w_lr / h_lr
-        ar_hr = w_hr / h_hr
+        # If aspect ratios are very similar, no fix is likely needed.
+        if abs((w_lr / h_lr) - (w_hr / h_hr)) < 0.05:
+            return False
 
-        if abs(ar_lr - ar_hr) < 0.05: return False
+        lr_gray = cv2.cvtColor(lr_img, cv2.COLOR_BGR2GRAY)
+        hr_gray = cv2.cvtColor(hr_img, cv2.COLOR_BGR2GRAY)
 
-        if ar_lr > ar_hr:
-            source_img, template_img, source_path = lr_img, hr_img, lr_path
-        else:
-            source_img, template_img, source_path = hr_img, lr_img, hr_path
+        # Contest 1: Find LR (content) inside HR (container).
+        score1, loc1 = _find_template_in_container(hr_gray, lr_gray)
 
-        h_template, w_template = template_img.shape[:2]
-        result = cv2.matchTemplate(source_img, template_img, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        # Contest 2: Find HR (content) inside LR (container).
+        score2, loc2 = _find_template_in_container(lr_gray, hr_gray)
 
-        if max_val < 0.7: return False
+        # --- Decide the winner and perform the crop ---
+        if score1 > score2 and score1 > config.CONTENT_FIX_THRESHOLD:
+            # Winner: LR is content, HR is container. Crop HR.
+            top_left = loc1
+            bottom_right = (top_left[0] + w_lr, top_left[1] + h_lr)
+            cropped_img = hr_img[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
+            if cropped_img.size > 0:
+                cv2.imwrite(str(hr_path), cropped_img)
+                return True
+        elif score2 > score1 and score2 > config.CONTENT_FIX_THRESHOLD:
+            # Winner: HR is content, LR is container. Crop LR.
+            top_left = loc2
+            bottom_right = (top_left[0] + w_hr, top_left[1] + h_hr)
+            cropped_img = lr_img[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
+            if cropped_img.size > 0:
+                cv2.imwrite(str(lr_path), cropped_img)
+                return True
 
-        top_left = max_loc
-        bottom_right = (top_left[0] + w_template, top_left[1] + h_template)
-        cropped_source = source_img[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
-        cv2.imwrite(str(source_path), cropped_source)
-        return True
+        return False
     except Exception:
+        # Silently fail on any error to not stop the whole batch process.
         return False
 
 def fix_mismatched_content_in_folders(lr_base: Path, hr_base: Path, prog_file: Path):
-    """Iterates through all extracted frames and applies the pan-and-scan fix."""
-    stage = 'pan_scan_fix'
+    """Iterates through all extracted frames and applies the universal content fix."""
+    stage = 'content_fix'
     prog_data = get_progress(prog_file)
     if prog_data.get(stage, {}).get('completed', False):
-        print("Pan-and-scan content fix already completed. Skipping.")
+        print("Mismatched content fix already completed. Skipping.")
         return
 
-    print("\n--- Attempting to Fix Mismatched (Pan & Scan) Content ---")
+    print(f"\n--- Attempting to Fix Mismatched Content (Threshold: {config.CONTENT_FIX_THRESHOLD}) ---")
     vid_folders = [f for f in lr_base.iterdir() if f.is_dir()]
     processed_folders = prog_data.get(stage, {}).get('items', [])
     total_fixed = 0
 
-    for vid_folder in tqdm(vid_folders, desc="Fixing Pan & Scan"):
-        if vid_folder.name in processed_folders: continue
+    for vid_folder in tqdm(vid_folders, desc="Fixing Content Mismatches"):
+        if vid_folder.name in processed_folders:
+            continue
+
         hr_vid_folder = hr_base / vid_folder.name
         if not hr_vid_folder.is_dir(): continue
 
@@ -663,17 +704,21 @@ def fix_mismatched_content_in_folders(lr_base: Path, hr_base: Path, prog_file: P
 
         fixed_count = 0
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {executor.submit(fix_pan_and_scan_pair, lr, hr): lr for lr, hr in image_pairs}
+            futures = {executor.submit(fix_mismatched_content_pair, lr, hr): lr for lr, hr in image_pairs}
             for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Analyzing {vid_folder.name}", leave=False):
                 try:
-                    if fut.result(): fixed_count += 1
-                except Exception: pass
-        
-        if fixed_count > 0: print(f"  Applied pan-and-scan crop fix to {fixed_count} pairs in {vid_folder.name}.")
+                    if fut.result():
+                        fixed_count += 1
+                except Exception:
+                    pass
+
+        if fixed_count > 0:
+            print(f"  Applied content-crop fix to {fixed_count} pairs in {vid_folder.name}.")
+
         total_fixed += fixed_count
         update_progress(prog_file, stage, item=vid_folder.name)
 
-    print(f"--- Pan & Scan Fix Finished. Total pairs fixed: {total_fixed} ---")
+    print(f"--- Mismatched Content Fix Finished. Total pairs fixed: {total_fixed} ---")
     update_progress(prog_file, stage, completed=True)
 
 def autocrop_single_image(img_path: Path, out_path: Path, crop_black: bool, black_thresh: int, crop_white: bool, white_thresh: int, min_dim: int):
@@ -1180,18 +1225,18 @@ if __name__ == "__main__":
     if config.ENABLE_SISR_FILTERING: sisr_fld.mkdir(exist_ok=True)
 
     print("--- Pipeline Configuration ---")
-    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("Pan & Scan Fix", config.ATTEMPT_PAN_AND_SCAN_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("SISR Filtering", config.ENABLE_SISR_FILTERING)]:
+    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("Content Fix", config.ATTEMPT_CONTENT_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("SISR Filtering", config.ENABLE_SISR_FILTERING)]:
         print(f"{k}: {v}")
     if config.ENABLE_SISR_FILTERING and not SISR_AVAILABLE: print("  WARNING: SISR N/A (libs). Will be skipped.")
     elif config.ENABLE_SISR_FILTERING: print(f"  SISR: CLIP Dist={config.SISR_MIN_CLIP_DISTANCE}, Complexity={config.SISR_COMPLEXITY_THRESHOLD}, Brightness={config.SISR_MAX_BRIGHTNESS}")
 
-    print("\n=== Stage 1: Preprocessing (Extract & Timestamp) ===")
+    print("\n=== Stage 1: Preprocessing (Frame Extraction) ===")
     lr_ext_base, hr_ext_base = preprocess_videos(lr_in, hr_in, extracted_fld, prog_f)
 
-    if config.ATTEMPT_PAN_AND_SCAN_FIX:
+    if config.ATTEMPT_CONTENT_FIX:
         fix_mismatched_content_in_folders(lr_ext_base, hr_ext_base, prog_f)
     else:
-        print("\nSkipping Pan & Scan Fix (disabled).")
+        print("\nSkipping Mismatched Content Fix (disabled).")
     
     if config.CROP_BLACK_BORDERS or config.CROP_WHITE_BORDERS:
         autocrop_frames_in_folders(lr_ext_base, prog_f, "_LR")
@@ -1204,27 +1249,31 @@ if __name__ == "__main__":
     else:
         print("\nSkipping Low Info Filter (disabled).")
 
-    print("\n=== Stage 2: Matching (Windowed & Temporal Filter) ===")
+    print("\n=== Stage 2: Temporal Matching ===")
     process_folder_pair(lr_ext_base, hr_ext_base, lr_matched_out, hr_matched_out, prog_f)
-
+    
+    print("\n=== Stage 3: Deduplication ===")
     if config.PHASH_SIMILARITY_THRESHOLD >= 0:
         filter_similar_images_phash(lr_matched_out, hr_matched_out, prog_f)
+    else:
+        print("Skipping pHash Deduplication (disabled).")
     
-    print("\n=== Stage 4: Aligning (ImgAlign) ===")
+    print("\n=== Stage 4: Final Alignment ===")
     align_images(lr_matched_out, hr_matched_out, aligned_fld, prog_f)
 
+    print("\n=== Stage 5: SISR Curation (Optional) ===")
     if config.ENABLE_SISR_FILTERING:
         if SISR_AVAILABLE:
             filter_aligned_with_sisr(aligned_fld / "LR", aligned_fld / "HR", sisr_fld / "LR", sisr_fld / "HR", prog_f)
         else:
-            print("\nSkipping SISR (libs N/A).")
+            print("Skipping SISR (libraries not available).")
     else:
-        print("\nSkipping SISR (disabled).")
+        print("Skipping SISR (disabled).")
 
     total_time = time.time() - t_start
-    print(f"\n--- Pipeline Finished --- Total Time: {total_time:.2f}s ---")
+    print(f"\n--- Pipeline Finished --- Total Time: {total_time/60:.2f} minutes ---")
     print("\n=== Final Output Summary ===")
-    if lr_matched_out.exists(): print(f"Matched pairs: {len(list(lr_matched_out.glob('*.png')))}")
+    if lr_matched_out.exists(): print(f"Matched pairs (before alignment): {len(list(lr_matched_out.glob('*.png')))}")
     if (aligned_lr := aligned_fld / "LR").exists(): print(f"Aligned pairs: {len(list(aligned_lr.glob('*.png')))}")
     if config.ENABLE_SISR_FILTERING and (sisr_lr := sisr_fld / "LR").exists(): print(f"SISR filtered pairs: {len(list(sisr_lr.glob('*.png')))}")
     print(f"\nOutput directory: {out_base}")
