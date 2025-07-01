@@ -10,7 +10,7 @@ The pipeline intelligently handles complex real-world video challenges, such as 
 
 <p align="center">
   <em>(A visual demonstration of an unaligned pair vs. a final aligned overlay)</em><br>
-  <img src="https://i.imgur.com/k2oT8yZ.gif" width="800" alt="Demonstration of image alignment">
+  <img src="https://pub-c7629c2cc932473c8827d6974dac86ea.r2.dev/1751376357.1178532.png" width="1024" alt="Demonstration of image alignment">
 </p>
 
 ## Key Features
