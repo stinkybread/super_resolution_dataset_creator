@@ -1,18 +1,20 @@
+# --- START OF FILE config.py ---
+
 # config.py
 
 import os
 
 # --- Input/Output Paths ---
-LR_INPUT_VIDEO_FOLDER = "E:\\Movie7\\\LR"  # Path to the folder containing Low-Resolution videos
+LR_INPUT_VIDEO_FOLDER = "E:\\Movie7\\LR"  # Path to the folder containing Low-Resolution videos
 HR_INPUT_VIDEO_FOLDER = "E:\\Movie7\\HR" # Path to the folder containing High-Resolution videos
 OUTPUT_BASE_FOLDER = "E:\\Movie7\\Output" # Base directory where all processed files will be saved
 
 # --- Frame Extraction & Preprocessing ---
 BEGIN_TIME = "00:00:00"  # Start time for frame extraction "HH:MM:SS"
 END_TIME = "00:00:00"    # End time for frame extraction "HH:MM:SS"
-SCENE_THRESHOLD = 0.15   # Scene change detection sensitivity for FFmpeg (0.0 to 1.0).
+SCENE_THRESHOLD = 0.25   # Scene change detection sensitivity for FFmpeg (0.0 to 1.0).
 
-LR_WIDTH, LR_HEIGHT = 720, 540 # Target width/height for LR frames. None to keep original.
+LR_WIDTH, LR_HEIGHT = None, None # Target width/height for LR frames. None to keep original.
 LR_SCALE = None          # Scale factor for LR frames. Overrides width/height.
 HR_WIDTH, HR_HEIGHT = None, None # Target width/height for HR frames. None to keep original.
 HR_SCALE = None          # Scale factor for HR frames. Overrides width/height.
@@ -21,9 +23,27 @@ HR_SCALE = None          # Scale factor for HR frames. Overrides width/height.
 DEINTERLACE_MODE = 'none' # Options: 'none', 'lr', 'hr', 'both', 'auto'
 DEINTERLACE_FILTER = 'bwdif=mode=send_frame:parity=auto'
 
+# --- High-Quality Chroma Upsampling (SDR Color Fidelity) ---
+# Enable this to fix the "blocky color" issue. Highly recommended for standard videos.
+ENABLE_CHROMA_UPSAMPLING = True
+CHROMA_UPSAMPLING_FILTER = 'scale=sws_flags=lanczos:in_color_matrix=bt709,format=yuv444p'
+
+# --- HDR to SDR Tone Mapping (HDR Color Correction) ---
+# Enable this ONLY if your source videos are in HDR (e.g., 4K HDR Blu-ray).
+ENABLE_HDR_TONE_MAPPING = False # Default to False.
+HDR_TONE_MAPPING_FILTER = 'zscale=t=linear:npl=100,tonemap=tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=bgr24'
+
+# --- Pan & Scan / Mismatched Content Fix ---
+# Enable this if matching a widescreen source against a fullscreen (pan-and-scan) version.
+# This will crop the widescreen image to match the fullscreen content before alignment.
+# This is computationally intensive but crucial for these scenarios.
+ATTEMPT_PAN_AND_SCAN_FIX = True
+
 # --- Autocropping Configuration ---
 CROP_BLACK_BORDERS = True
-CROP_BLACK_THRESHOLD = 15
+CROP_WHITE_BORDERS = False  # Enable to crop white/light-colored borders
+CROP_BLACK_THRESHOLD = 15  # Pixels below this value are considered black border
+CROP_WHITE_THRESHOLD = 240 # Pixels above this value are considered white border
 CROP_MIN_CONTENT_DIMENSION = 300
 
 # --- Low Information Filter Configuration (Pre-Match) ---
@@ -37,18 +57,14 @@ MATCH_THRESHOLD = 0.65 # Threshold for cv2.TM_CCOEFF_NORMED. Adjust based on con
 MATCH_RESIZE_HEIGHT = 540 # Internal height for resizing frames *before* template matching.
 MATCH_RESIZE_WIDTH = int(MATCH_RESIZE_HEIGHT * (4/3)) # Internal width.
 
-# Percentage of LR video duration for the *initial* HR candidate search window (e.g., for the first LR frame).
-# 0.06 means +/- 6% of total LR video duration from the LR frame's timestamp.
+# Percentage of LR video duration for the *initial* HR candidate search window.
 INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE = 0.06
 
-# Fixed seconds window to search for HR candidates around the *expected* HR time
-# for *subsequent* LR frames (after a first match is found and state is established).
-# This window accounts for local drift (e.g., PAL speedup over shorter segments).
-SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS = 5 # e.g., +/- 5 seconds from expected HR time
+# Fixed seconds window to search for HR candidates for *subsequent* LR frames.
+SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS = 5
 
-# Fallback fixed window in seconds if percentage-based calculation is problematic (e.g., duration is 0)
-# or for very short videos.
-FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS = 10.0 # e.g., +/- 10 seconds
+# Fallback fixed window in seconds for very short videos or if duration is unknown.
+FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS = 10.0
 
 # --- Similarity Filtering (Perceptual Hash - Post-Match, Pre-Align) ---
 PHASH_SIMILARITY_THRESHOLD = 4 # pHash difference. Lower is stricter. -1 to disable.
@@ -74,3 +90,4 @@ METADATA_FILENAME = "metadata.json" # For storing duration and timestamps
 # If None, the script will try to find them in PATH.
 FFMPEG_PATH = None
 FFPROBE_PATH = None
+# --- END OF FILE config.py ---
