@@ -1,121 +1,159 @@
-## Acknowledgements for Code & Inspiration
-1. Anthorpic's Calude (https://claude.ai/new)
-2. Google AI Studio (https://aistudio.google.com/)
-3. Enhance Everything Discord
-4. neosr - https://github.com/neosr-project/neosr
+Of course. You've built a powerful and complex tool, and a clear README is essential for anyone (including your future self) to use it effectively.
 
--------------------------------
+I have reviewed your existing README, analyzed the final state of our code, and created a completely new, more comprehensive version. This new README is structured for clarity on GitHub, explains the "why" behind features, and provides a much more robust guide for new users.
 
-# Video-to-Paired-Image Dataset Creation Pipeline (SRDC)
+Here is the updated README. You can copy and paste this entire block into your `README.md` file.
 
-This project provides a comprehensive Python-based pipeline for generating high-quality, paired Low-Resolution (LR) and High-Resolution (HR) image datasets from video sources. Such datasets are crucial for training Super-Resolution (SR) models and other image restoration tasks.
+---
 
-The pipeline automates various stages including frame extraction, deinterlacing, scene change detection, content-aware filtering, image matching, alignment, and advanced selection based on image complexity and visual uniqueness using CLIP.
+# SRDC: A Video-to-Paired-Image Dataset Pipeline
 
-## Features
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/your-username/your-repo/pulls)
 
-*   **Video Frame Extraction**: Extracts frames from LR and HR video pairs using FFmpeg.
-*   **Scene Change Detection**: Selects frames primarily from stable scenes, avoiding rapid transitions.
-*   **Deinterlacing**: Optional automatic or manual deinterlacing for interlaced video sources.
-*   **Autocropping**: Removes black borders from extracted frames.
-*   **Low-Information Filtering**: Discards overly plain or uninformative frames/pairs based on image variance.
-*   **LR/HR Frame Matching**: Accurately pairs corresponding LR and HR frames using template matching (with GPU acceleration).
-*   **Similarity Filtering**: Removes duplicate or near-duplicate image pairs using perceptual hashing (pHash).
-*   **Image Alignment**: Spatially aligns LR and HR image pairs using the [ImgAlign tool](https://github.com/NicholasGU/ImgAlign).
-*   **Advanced SISR Filtering**: Utilizes the `SuperResImageSelector` module to:
-    *   Calculate image complexity (entropy, edge density, sharpness) and brightness.
-    *   Extract CLIP (Contrastive Language-Image Pre-Training) visual features.
-    *   Select a diverse set of images suitable for SR training by filtering based on complexity, brightness, and CLIP feature distance.
-*   **Progress Tracking & Resumption**: Saves progress in a `progress.json` file, allowing the pipeline to be resumed.
-*   **Modular Design**: Each processing stage is distinct and can be configured or (in some cases) skipped.
-*   **Configurable**: Extensive options available directly in the main script (`srdc_pipeline.py`).
+SRDC is a powerful, automated Python pipeline designed to convert pairs of Low-Resolution (LR) and High-Resolution (HR) videos into high-quality, aligned image datasets. These datasets are essential for training and evaluating Super-Resolution (SR), de-noising, and other image restoration models.
 
-## System Requirements
+The pipeline intelligently handles complex real-world video challenges, such as mismatched aspect ratios (widescreen vs. fullscreen), color space differences (SDR/HDR), and temporal drift, to produce clean, content-matched, and spatially aligned image pairs.
 
-*   Python 3.7+
-*   **Python Packages**:
-    *   `torch` & `torchvision`
-    *   `transformers`
-    *   `Pillow (PIL)`
-    *   `opencv-python` (cv2)
-    *   `scipy`
-    *   `numpy`
-    *   `tqdm`
-    *   `psutil`
-    *   `imagehash`
-    *   (A `requirements.txt` file would be beneficial)
-*   **External Tools**:
-    *   **FFmpeg**: Must be installed and accessible in your system's PATH. ([Download FFmpeg](https://ffmpeg.org/download.html))
-    *   **ImgAlign**: Must be compiled and accessible in your system's PATH. ([Download ImgAlign](https://github.com/NicholasGU/ImgAlign))
-*   **Hardware**:
-    *   A CUDA-capable GPU is highly recommended for significant speedups in PyTorch (CLIP) and OpenCV operations. The pipeline includes CPU fallbacks.
-    *   Sufficient RAM, especially for the `SuperResImageSelector` when processing a large number of candidate images.
-    *   Disk space for storing extracted frames and processed datasets.
+<!-- TODO: Consider creating a GIF showing an LR input, HR input, and the final aligned Overlay output to showcase the pipeline's effectiveness. -->
+<!-- <p align="center"><img src="docs/srdc_pipeline_demo.gif" width="800"></p> -->
+
+## Key Features
+
+*   **High-Quality Frame Extraction**: Uses FFmpeg with advanced filters to ensure maximum color fidelity, preventing common issues like blocky color edges (`chroma upsampling`) and washed-out colors from HDR sources (`tone mapping`).
+*   **Widescreen / Pan-and-Scan Correction**: A critical pre-processing step that automatically detects and crops widescreen footage to match the content of a corresponding fullscreen (pan-and-scan) version, dramatically improving alignment success.
+*   **Versatile Border Cropping**: Intelligently removes black *and/or* white letterbox/pillarbox bars from frames.
+*   **Robust Temporal Matching**: A multi-stage process that uses a fast, downscaled template match to find corresponding frames in time, with a sliding window to account for drift (e.g., PAL vs. NTSC speed differences).
+*   **Sub-Pixel Image Alignment**: Leverages the powerful `ImgAlign` tool to perform a final, precise spatial alignment of the matched pairs, correcting for minor shifts, rotation, and scaling.
+*   **Content-Aware Filtering**:
+    *   **Low-Information Filter**: Discards overly simple frames (e.g., solid black or white) based on variance.
+    *   **Perceptual Deduplication**: Uses pHash to remove visually redundant or near-identical image pairs.
+*   **Advanced Dataset Curation with CLIP**: An optional final stage that uses the `SuperResImageSelector` to build a visually diverse and complex dataset, ideal for training robust SR models. It filters images based on complexity, brightness, and visual uniqueness (CLIP feature distance).
+*   **Resumable & Organized**: The entire pipeline is broken into logical stages with progress saved to a `progress.json` file, allowing you to stop and resume processing. Outputs are neatly organized into folders for each stage.
+*   **Highly Configurable**: A central `config.py` file allows easy tuning of every aspect of the pipeline without touching the core logic.
+
+## Pipeline Workflow
+
+The script executes a series of stages, with the output of one stage becoming the input for the next.
+
+```
+Input Videos (LR/HR)
+     │
+     ▼
+[ 1. Frame Extraction ] ──> (Deinterlacing, Chroma Upsampling, HDR Tone Mapping)
+     │
+     ▼
+[ 2. Pan & Scan Fix ] ──> (Crops widescreen to match fullscreen content)
+     │
+     ▼
+[ 3. Border Cropping ] ──> (Removes letterbox/pillarbox bars)
+     │
+     ▼
+[ 4. Frame Matching ] ──> (Finds LR/HR pairs corresponding in time)
+     │
+     ▼
+[ 5. Deduplication ] ──> (Removes visually similar pairs via pHash)
+     │
+     ▼
+[ 6. Alignment ] ──> (Spatially aligns the final pairs using ImgAlign)
+     │
+     ▼
+[ 7. SISR Filtering (Optional) ] ──> (Selects a diverse subset using CLIP)
+     │
+     ▼
+Final Paired Dataset
+```
+
+## Requirements
+
+#### External Tools
+These must be installed and accessible in your system's PATH.
+*   **FFmpeg**: For video processing. ([Download](https://ffmpeg.org/download.html))
+*   **ImgAlign**: For the final alignment step. ([Download & Compile from GitHub](https://github.com/NicholasGU/ImgAlign))
+
+#### Python Environment
+*   Python 3.9+ is recommended.
+*   A CUDA-capable GPU is **highly recommended** for acceptable performance in the alignment (`ImgAlign`) and SISR filtering (`PyTorch`) stages.
+*   Create and activate a virtual environment:
+    ```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
+    ```
+*   Install the required packages. A `requirements.txt` can be created from a working environment with `pip freeze > requirements.txt`. A typical set of requirements would be:
+    ```text
+    # requirements.txt
+    opencv-python
+    numpy
+    torch
+    torchvision
+    transformers
+    Pillow
+    imagehash
+    scipy
+    tqdm
+    psutil
+    ```
+    Install them with:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 ## File Structure
+
 ```
 .
-├── srdc_pipeline.py # Main pipeline script (srdc_v3.py in your files)
-├── sisr_image_selector.py # Module for SISR-suitability filtering
-├── LR_VIDEOS/ # Your input Low-Resolution videos
-│ └── video1.mp4
-├── HR_VIDEOS/ # Your input High-Resolution videos
-│ └── video1.mp4
-└── OUTPUT_BASE_FOLDER/ # Root output directory (configurable)
-├── 1_EXTRACTED/
-│ ├── LR/
-│ │ └── video1/ # Frames per video
-│ │ └── frame_000001.png
-│ └── HR/
-│ └── video1/
-│ └── frame_000001.png
-├── 2_MATCHED/
-│ ├── LR/
-│ │ └── video1_frame_000001.png
-│ └── HR/
-│ └── video1_frame_000001.png
-├── 3_ALIGNED/
-│ ├── LR/
-│ ├── HR/
-│ └── Overlay/ # Alignment visualization
-├── 4_SISR_FILTERED/ # Optional final filtered output
-│ ├── LR/
-│ └── HR/
-├── progress.json # Tracks pipeline progress for resumption
-└── temp_YYYYMMDD_HHMMSS/ # Temporary directory for sisr_image_selector checkpoints
+├── srdc_pipeline.py            # The main pipeline script.
+├── config.py                   # All user-configurable settings.
+├── README.md                   # This file.
+├── LR/                           # Your input Low-Resolution videos.
+│   └── movie_v1.mp4
+└── HR/                           # Your input High-Resolution videos.
+    └── movie_v1.mkv              # <-- Note: Extension can be different.
+```
+The pipeline will generate an `Output` folder (name configurable) with the following structure:
+```
+OUTPUT_BASE_FOLDER/
+├── 1_EXTRACTED/                # Raw frames extracted from videos.
+├── 2_MATCHED/                  # Temporally matched but unaligned pairs.
+├── 3_ALIGNED/                  # Spatially aligned, clean pairs.
+│   ├── LR/
+│   ├── HR/
+│   └── Overlay/                # Visualizations of the alignment.
+├── 4_SISR_FILTERED/            # Optional, highly-curated final dataset.
+│   ├── LR/
+│   └── HR/
+└── progress.json               # Tracks pipeline state for resumption.
 ```
 
+## Setup & Usage
 
-## Configuration
+1.  **Clone the Repository**:
+    ```bash
+    git clone https://github.com/your-username/your-repo.git
+    cd your-repo
+    ```
+2.  **Install Dependencies**: Ensure Python, FFmpeg, and ImgAlign are installed and in your PATH. Install Python packages as described in the *Requirements* section.
 
-All major configuration options are located at the beginning of the `srdc_pipeline.py` script. Key parameters include:
+3.  **Prepare Videos**: Place your LR and HR videos into their respective input folders (e.g., `LR/` and `HR/`). The script will match videos based on their filenames, ignoring the extension (e.g., `movie.mp4` will match `movie.mkv`).
 
-*   Input/Output paths (`lr_input_video_folder`, `hr_input_video_folder`, `output_base_folder`).
-*   Frame extraction settings (`begin_time`, `end_time`, `scene_threshold`, scaling options).
-*   Deinterlacing options (`DEINTERLACE_MODE`, `DEINTERLACE_FILTER`).
-*   Autocropping settings (`CROP_BLACK_BORDERS`, `CROP_BLACK_THRESHOLD`).
-*   Low information filter settings (`ENABLE_LOW_INFO_FILTER`, `LOW_INFO_VARIANCE_THRESHOLD`).
-*   Matching parameters (`match_threshold`, `resize_height`, `resize_width`).
-*   Similarity (pHash) filter threshold (`similarity_threshold`).
-*   ImgAlign scale (`img_align_scale`).
-*   SISR filter settings (`ENABLE_SISR_FILTERING`, `SISR_MIN_CLIP_DISTANCE`, `SISR_COMPLEXITY_THRESHOLD`, `SISR_MAX_BRIGHTNESS`).
+4.  **Configure the Pipeline**: Open `config.py` in a text editor. Adjust the paths, and enable/disable features to suit your needs. **Review this file carefully.** The most important settings are:
+    *   `LR_INPUT_VIDEO_FOLDER`, `HR_INPUT_VIDEO_FOLDER`, `OUTPUT_BASE_FOLDER`.
+    *   `ATTEMPT_PAN_AND_SCAN_FIX`: **Set to `True`** if you are matching widescreen and fullscreen videos.
+    *   `ENABLE_CHROMA_UPSAMPLING`: Keep `True` for most SDR videos.
+    *   `ENABLE_HDR_TONE_MAPPING`: Set to `True` only for HDR source material.
 
-Please review and adjust these parameters to suit your specific video sources and dataset requirements.
-
-## Usage
-
-1.  **Prepare Input Videos**: Place your LR videos in the `lr_input_video_folder` and corresponding HR videos (with matching filenames) in the `hr_input_video_folder`.
-2.  **Configure Pipeline**: Open `srdc_pipeline.py` and modify the configuration variables towards the bottom of the file as needed.
-3.  **Run Pipeline**: Execute the main script from your terminal:
+5.  **Run the Pipeline**:
     ```bash
     python srdc_pipeline.py
     ```
-4.  **Monitor Progress**: The script will output progress to the console. Intermediate results will be saved in the configured `output_base_folder`.
-5.  **Resumption**: If the pipeline is interrupted, it can often be resumed by running the script again. It will attempt to pick up from the last completed stage/video based on `progress.json`.
+    The script will print its progress for each stage. If it's interrupted, you can typically run it again to resume from where it left off.
 
-### `sisr_image_selector.py` Standalone Usage
+## License
+This project is licensed under the MIT License. See the `LICENSE` file for details.
 
-While integrated into the main pipeline, `sisr_image_selector.py` can also be run as a standalone tool:
-
-```bash
-python sisr_image_selector.py <input_folder> [--min_distance 0.15] [--complexity_threshold 0.4] [--max_brightness 200]
+## Acknowledgements
+*   The Anthropic team for Claude.
+*   The Google AI team for AI Studio.
+*   The Enhance Everything Discord community for inspiration and discussion.
+*   The [neosr](https://github.com/neosr-project/neosr) project for concepts in super-resolution.
