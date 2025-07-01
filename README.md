@@ -1,11 +1,3 @@
-Of course. You've built a powerful and complex tool, and a clear README is essential for anyone (including your future self) to use it effectively.
-
-I have reviewed your existing README, analyzed the final state of our code, and created a completely new, more comprehensive version. This new README is structured for clarity on GitHub, explains the "why" behind features, and provides a much more robust guide for new users.
-
-Here is the updated README. You can copy and paste this entire block into your `README.md` file.
-
----
-
 # SRDC: A Video-to-Paired-Image Dataset Pipeline
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
