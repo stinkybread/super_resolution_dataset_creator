@@ -122,8 +122,8 @@ OUTPUT_BASE_FOLDER/
 
 1.  **Clone the Repository**:
     ```bash
-    git clone https://github.com/your-username/your-repo.git
-    cd your-repo
+    git clone https://github.com/stinkybread/super_resolution_dataset_creator.git
+    cd super_resolution_dataset_creator
     ```
 2.  **Install Dependencies**: Ensure Python, FFmpeg, and ImgAlign are installed and in your PATH. Install Python packages as described in the *Requirements* section.
 
