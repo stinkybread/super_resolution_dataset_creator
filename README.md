@@ -9,7 +9,7 @@ SRDC is a powerful, automated Python pipeline designed to convert pairs of Low-R
 The pipeline intelligently handles complex real-world video challenges, such as mismatched aspect ratios (widescreen vs. fullscreen), color space differences (SDR/HDR), and temporal drift, to produce clean, content-matched, and spatially aligned image pairs.
 
 <p align="center">
-  <em>(A visual demonstration of an unaligned pair vs. a final aligned overlay)</em><br>
+  <em>(A Low Resolution Image vs. An Aligned High Resolution Image)</em><br>
   <img src="https://pub-c7629c2cc932473c8827d6974dac86ea.r2.dev/1751376357.1178532.png" width="1024" alt="Demonstration of image alignment">
 </p>
 
