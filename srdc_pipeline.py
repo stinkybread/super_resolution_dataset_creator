@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 from collections import defaultdict
 import time
+import json
 
 # Attempt to import ImageHash related libraries
 try:
@@ -406,6 +407,34 @@ def get_video_duration(video_path: Path) -> float | None:
         print(f"ffprobe error getting duration for {video_path.name}: {e}")
     return None
 
+def is_hdr_video(video_path: Path) -> bool:
+    global FFPROBE_PATH
+    cmd = [
+        FFPROBE_PATH, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=color_transfer,color_primaries,side_data_list",
+        "-of", "json",
+        str(video_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+        data = json.loads(result.stdout)
+        stream = data.get('streams', [{}])[0]
+        
+        # Check for HDR indicators
+        if stream.get('color_transfer') in ['smpte2084', 'arib-std-b67']:
+            return True
+        if stream.get('color_primaries') == 'bt2020':
+            return True
+        if any(sd.get('side_data_type') == 'Dolby Vision' 
+               for sd in stream.get('side_data_list', [])):
+            return True
+            
+    except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
+        return False
+    return False
+
 def detect_interlacing(video_path: Path, probe_duration: int = 10) -> bool:
     """Detect if video is interlaced using ffmpeg idet filter."""
     global FFMPEG_PATH
@@ -454,6 +483,8 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
     output_folder.mkdir(parents=True, exist_ok=True)
 
     apply_deinterlace = False
+    apply_hdr = False
+
     if deinterlace_mode == 'auto':
         apply_deinterlace = detect_interlacing(video_path)
     elif deinterlace_mode == 'both':
@@ -470,6 +501,10 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
         if end_time != "00:00:00":
             cmd.extend(["-to", end_time])
 
+    if config.ENABLE_HDR_TONE_MAPPING:
+        apply_hdr = is_hdr_video(video_path)
+        print(f"HDR detected: {apply_hdr} for {video_path.name}")
+
     vf = []
     if apply_deinterlace:
         vf.append(deinterlace_filter)
@@ -477,10 +512,10 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
     if config.ENABLE_CHROMA_UPSAMPLING:
         vf.append(config.CHROMA_UPSAMPLING_FILTER)
         print(f"Applying high-quality chroma upsampling to {video_path.name}")
-    if config.ENABLE_HDR_TONE_MAPPING:
+    if apply_hdr:
         vf.append(config.HDR_TONE_MAPPING_FILTER)
         print(f"Applying HDR tone mapping to {video_path.name}")
-
+    
     vf.append(f"select='gt(scene,{scene_threshold})',showinfo")
 
     cmd.extend([
