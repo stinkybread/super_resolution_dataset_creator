@@ -1,5 +1,3 @@
-# --- START OF FILE srdc_pipeline.py ---
-
 # srdc_pipeline.py - Complete SRDC Processing Pipeline
 
 import cv2
@@ -15,6 +13,8 @@ import re
 from pathlib import Path
 from collections import defaultdict
 import time
+import select
+import sys
 
 # Attempt to import ImageHash related libraries
 try:
@@ -406,6 +406,33 @@ def get_video_duration(video_path: Path) -> float | None:
         print(f"ffprobe error getting duration for {video_path.name}: {e}")
     return None
 
+def detect_hdr_content(video_path: Path) -> bool:
+    """Simple HDR detection using ffprobe."""
+    global FFPROBE_PATH
+    if not FFPROBE_PATH:
+        return False
+    
+    cmd = [
+        FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=color_transfer,color_primaries,pix_fmt",
+        "-of", "csv=p=0", str(video_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        output = result.stdout.strip().lower()
+        
+        # Common HDR indicators
+        hdr_indicators = ['smpte2084', 'arib-std-b67', 'bt2020', 'pq', 'hlg']
+        is_hdr = any(indicator in output for indicator in hdr_indicators)
+        
+        if is_hdr:
+            print(f"  HDR content detected in {video_path.name}: {output}")
+        
+        return is_hdr
+    except Exception:
+        return False
+
 def detect_interlacing(video_path: Path, probe_duration: int = 10) -> bool:
     """Detect if video is interlaced using ffmpeg idet filter."""
     global FFMPEG_PATH
@@ -463,6 +490,20 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
     elif deinterlace_mode == 'hr' and video_type == 'hr':
         apply_deinterlace = True
 
+    # Determine if HDR tone mapping should be applied
+    apply_hdr_tone_mapping = False
+    if config.ENABLE_HDR_TONE_MAPPING:
+        hdr_mode = getattr(config, 'HDR_TONE_MAPPING_MODE', 'hr_only')
+        if hdr_mode == 'both':
+            apply_hdr_tone_mapping = True
+        elif hdr_mode == 'hr_only' and video_type == 'hr':
+            apply_hdr_tone_mapping = True
+        elif hdr_mode == 'lr_only' and video_type == 'lr':
+            apply_hdr_tone_mapping = True
+        elif hdr_mode == 'auto':
+            # Simple HDR detection - you could enhance this
+            apply_hdr_tone_mapping = detect_hdr_content(video_path)
+
     cmd = [FFMPEG_PATH, "-i", str(video_path)]
 
     if begin_time != "00:00:00" or end_time != "00:00:00":
@@ -477,9 +518,9 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
     if config.ENABLE_CHROMA_UPSAMPLING:
         vf.append(config.CHROMA_UPSAMPLING_FILTER)
         print(f"Applying high-quality chroma upsampling to {video_path.name}")
-    if config.ENABLE_HDR_TONE_MAPPING:
+    if apply_hdr_tone_mapping:
         vf.append(config.HDR_TONE_MAPPING_FILTER)
-        print(f"Applying HDR tone mapping to {video_path.name}")
+        print(f"Applying HDR tone mapping to {video_type.upper()} video: {video_path.name}")
 
     vf.append(f"select='gt(scene,{scene_threshold})',showinfo")
 
@@ -502,7 +543,7 @@ def extract_frames_ffmpeg(video_path: Path, output_folder: Path, begin_time: str
         log_message = f"Frames extracted from {video_path.name}"
         if apply_deinterlace: log_message += " (Deinterlaced)"
         if config.ENABLE_CHROMA_UPSAMPLING: log_message += " (Chroma Upsampled)"
-        if config.ENABLE_HDR_TONE_MAPPING: log_message += " (HDR Tonemapped)"
+        if apply_hdr_tone_mapping: log_message += f" (HDR Tonemapped - {video_type.upper()})"
         print(log_message)
 
         pts_re = re.compile(r'\[Parsed_showinfo.*pts_time:(\d+\.?\d*)')
@@ -1045,8 +1086,120 @@ def filter_similar_images_phash(lr_matched: Path, hr_matched: Path, prog_file: P
     print(f"pHash filter done. Total removed: {tot_rem}.")
     update_progress(prog_file, stage, completed=True)
 
-def align_images(lr_matched: Path, hr_matched: Path, aligned_base: Path, prog_file: Path):
-    """Align image pairs using ImgAlign tool."""
+def run_imgalign_with_streaming(cmd: list, vid_name: str, batch_suffix: str, timeout_seconds: int) -> bool:
+    """Run ImageAlign with real-time output streaming to prevent deadlocks."""
+    print(f"    ImgAlign cmd: {' '.join(cmd)}")
+    
+    try:
+        if config.IMG_ALIGN_ENABLE_PROGRESS_OUTPUT:
+            # Stream output in real-time to prevent buffer deadlocks
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                     text=True, encoding='utf-8', errors='replace', bufsize=1)
+            
+            start_time = time.time()
+            output_lines = []
+            
+            # Read output line by line with timeout checking
+            while True:
+                try:
+                    # Check if process finished
+                    if process.poll() is not None:
+                        break
+                    
+                    # Check timeout
+                    if time.time() - start_time > timeout_seconds:
+                        print(f"    ImgAlign ({vid_name}{batch_suffix}) timed out after {timeout_seconds/3600:.1f} hours")
+                        process.kill()
+                        process.wait()
+                        return False
+                    
+                    # Try to read a line with short timeout
+                    if sys.platform != 'win32':
+                        # Unix-like systems
+                        if select.select([process.stdout], [], [], 1.0)[0]:
+                            line = process.stdout.readline()
+                            if line:
+                                output_lines.append(line.rstrip())
+                                if len(output_lines) % 50 == 0:  # Print progress every 50 lines
+                                    print(f"    ImgAlign progress: {len(output_lines)} output lines...")
+                    else:
+                        # Windows - just wait a bit and check
+                        time.sleep(1)
+                        
+                except Exception as e:
+                    print(f"    Error reading ImgAlign output: {e}")
+                    break
+            
+            # Get final return code
+            return_code = process.wait()
+            
+        else:
+            # Original method but with longer timeout
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                     text=True, encoding='utf-8', errors='replace')
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            return_code = process.returncode
+            output_lines = stderr.splitlines() if stderr else []
+
+        if return_code != 0:
+            print(f"    ImgAlign ({vid_name}{batch_suffix}) failed with return code {return_code}")
+            if output_lines:
+                print(f"    Last output lines: {output_lines[-10:]}")
+            return False
+        
+        print(f"    ImgAlign ({vid_name}{batch_suffix}) completed successfully")
+        return True
+        
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        print(f"    ImgAlign ({vid_name}{batch_suffix}) timed out after {timeout_seconds/3600:.1f} hours")
+        return False
+    except Exception as e:
+        print(f"    ImgAlign ({vid_name}{batch_suffix}) error: {e}")
+        return False
+
+def process_imgalign_results(tmp_out: Path, final_lr: Path, final_hr: Path, final_ov: Path, 
+                           vid_name: str, batch_suffix: str) -> tuple[int, int]:
+    """Process ImageAlign results and move files to final locations."""
+    out_sub = tmp_out / "Output"
+    artifacts = set()
+    
+    if (art_f := out_sub / "Artifacts.txt").exists():
+        try: 
+            artifacts = {Path(l.strip()).stem for l in art_f.read_text().splitlines() if l.strip()}
+        except Exception as e: 
+            print(f"    Warning: Could not read Artifacts.txt: {e}")
+
+    moved, skipped = 0, 0
+    lr_output_folder = out_sub / "LR"
+    
+    if not lr_output_folder.is_dir():
+        print(f"    Warning: No 'LR' output folder found for {vid_name}{batch_suffix}")
+        return moved, skipped
+    
+    for lr_file in lr_output_folder.iterdir():
+        if not lr_file.is_file(): 
+            continue
+            
+        if lr_file.stem in artifacts:
+            skipped += 1
+            continue
+            
+        try:
+            shutil.move(str(lr_file), str(final_lr / lr_file.name))
+            if (hr_file := out_sub / "HR" / lr_file.name).exists(): 
+                shutil.move(str(hr_file), str(final_hr / lr_file.name))
+            if (ov_file := out_sub / "Overlay" / lr_file.name).exists(): 
+                shutil.move(str(ov_file), str(final_ov / lr_file.name))
+            moved += 1
+        except Exception as e: 
+            print(f"    Error moving {lr_file.name}: {e}")
+    
+    return moved, skipped
+
+def align_images_with_streaming_output(lr_matched: Path, hr_matched: Path, aligned_base: Path, prog_file: Path):
+    """Align image pairs using ImgAlign tool with improved timeout and progress handling."""
     stage = 'align'
     prog_data = get_progress(prog_file)
     if prog_data.get(stage, {}).get('completed', False):
@@ -1059,10 +1212,12 @@ def align_images(lr_matched: Path, hr_matched: Path, aligned_base: Path, prog_fi
         update_progress(prog_file, stage, completed=True)
         return
 
-    if aligned_base.exists(): shutil.rmtree(aligned_base)
+    if aligned_base.exists(): 
+        shutil.rmtree(aligned_base)
     aligned_base.mkdir(parents=True)
 
-    imgs_to_align = sorted([f for f in lr_matched.iterdir() if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')])
+    imgs_to_align = sorted([f for f in lr_matched.iterdir() 
+                           if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')])
     if not imgs_to_align:
         print("No images to align.")
         update_progress(prog_file, stage, completed=True)
@@ -1074,81 +1229,69 @@ def align_images(lr_matched: Path, hr_matched: Path, aligned_base: Path, prog_fi
     for p in imgs_to_align:
         groups[m.group(1) if (m := re_fname.match(p.name)) else 'unknown_align_group'].append(p)
 
-    processed, final_lr, final_hr, final_ov = prog_data.get(stage, {}).get('items', []), aligned_base / "LR", aligned_base / "HR", aligned_base / "Overlay"
+    processed = prog_data.get(stage, {}).get('items', [])
+    final_lr, final_hr, final_ov = aligned_base / "LR", aligned_base / "HR", aligned_base / "Overlay"
     final_lr.mkdir(); final_hr.mkdir(); final_ov.mkdir()
 
+    timeout_seconds = int(config.IMG_ALIGN_TIMEOUT_HOURS * 3600)
+    max_batch_size = config.IMG_ALIGN_MAX_BATCH_SIZE
+
     for vid_name, paths in tqdm(groups.items(), desc="Aligning videos"):
-        if vid_name == 'unknown_align_group' or vid_name in processed: continue
+        if vid_name == 'unknown_align_group' or vid_name in processed: 
+            continue
 
-        print(f"\nAligning group: {vid_name}...")
-        tmp_base = aligned_base / f"__temp_{vid_name}"
-        shutil.rmtree(tmp_base, ignore_errors=True)
-        tmp_lr, tmp_hr, tmp_out = tmp_base / "lr_in", tmp_base / "hr_in", tmp_base / "aligned_out"
-        tmp_lr.mkdir(parents=True); tmp_hr.mkdir(); tmp_out.mkdir()
-
-        for lr_p_src in tqdm(paths, desc=f"Prep batch {vid_name}", leave=False):
-            if (hr_p_src := hr_matched / lr_p_src.name).exists():
-                try:
-                    shutil.copy2(lr_p_src, tmp_lr / lr_p_src.name)
-                    shutil.copy2(hr_p_src, tmp_hr / hr_p_src.name)
-                except Exception: pass
+        print(f"\nAligning group: {vid_name} ({len(paths)} images)...")
         
-        if not any(tmp_lr.iterdir()):
-            print(f"No valid pairs for {vid_name}. Skip batch.")
-            shutil.rmtree(tmp_base)
-            update_progress(prog_file, stage, item=vid_name)
-            continue
-        
-        cmd = [imgalign_exe, "-s", str(config.IMG_ALIGN_SCALE), "-m", "0", "-g", str(tmp_hr), "-l", str(tmp_lr), "-c", "-i", "-1", "-j", "-ai", "-o", str(tmp_out)]
-        print(f"ImgAlign cmd: {' '.join(cmd)}")
-        timeout_seconds = 14400
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
-            if process.returncode != 0:
-                print(f"ImgAlign ({vid_name}) failed with return code {process.returncode}\nStdout: {stdout}\nStderr: {stderr}")
-                shutil.rmtree(tmp_base)
-                update_progress(prog_file, stage, item=vid_name)
-                continue
-            if stderr: print(f"ImgAlign ({vid_name}) warnings/info:\n{stderr.strip()[-1000:]}")
-            print(f"ImgAlign ({vid_name}) finished successfully.")
-        except subprocess.TimeoutExpired:
-            process.kill()
-            _, stderr = process.communicate()
-            print(f"ImgAlign ({vid_name}) timed out after {timeout_seconds / 3600:.1f} hours.\nStderr: {stderr}")
-            shutil.rmtree(tmp_base)
-            update_progress(prog_file, stage, item=vid_name)
-            continue
-        except Exception as e:
-            print(f"ImgAlign ({vid_name}) encountered an unhandled error: {e}")
-            shutil.rmtree(tmp_base)
-            update_progress(prog_file, stage, item=vid_name)
-            continue
-
-        out_sub = tmp_out / "Output"
-        artifacts = set()
-        if (art_f := out_sub / "Artifacts.txt").exists():
-            try: artifacts = {Path(l.strip()).stem for l in art_f.read_text().splitlines() if l.strip()}
-            except Exception as e: print(f"Warn: Could not read Artifacts.txt: {e}")
-
-        moved, skipped = 0, 0
-        if not (lr_output_folder := out_sub / "LR").is_dir():
-            print(f"Warning: No 'LR' output folder found in ImgAlign output for {vid_name}.")
+        # Split into batches if needed
+        if max_batch_size > 0 and len(paths) > max_batch_size:
+            batches = [paths[i:i + max_batch_size] for i in range(0, len(paths), max_batch_size)]
+            print(f"  Splitting into {len(batches)} batches of max {max_batch_size} images each")
         else:
-            for lr_file in lr_output_folder.iterdir():
-                if not lr_file.is_file(): continue
-                if lr_file.stem in artifacts:
-                    skipped += 1
-                    continue
-                try:
-                    shutil.move(str(lr_file), str(final_lr / lr_file.name))
-                    if (hr_file := out_sub / "HR" / lr_file.name).exists(): shutil.move(str(hr_file), str(final_hr / lr_file.name))
-                    if (ov_file := out_sub / "Overlay" / lr_file.name).exists(): shutil.move(str(ov_file), str(final_ov / lr_file.name))
-                    moved += 1
-                except Exception as e: print(f"Error moving aligned group for {lr_file.name}: {e}")
+            batches = [paths]
 
-        print(f"Moved {moved} aligned pairs for {vid_name}. Skipped {skipped} artifacts.")
-        shutil.rmtree(tmp_base)
+        for batch_idx, batch_paths in enumerate(batches):
+            batch_suffix = f"_batch_{batch_idx + 1}" if len(batches) > 1 else ""
+            print(f"\n  Processing{batch_suffix}: {len(batch_paths)} images...")
+            
+            tmp_base = aligned_base / f"__temp_{vid_name}{batch_suffix}"
+            shutil.rmtree(tmp_base, ignore_errors=True)
+            tmp_lr, tmp_hr, tmp_out = tmp_base / "lr_in", tmp_base / "hr_in", tmp_base / "aligned_out"
+            tmp_lr.mkdir(parents=True); tmp_hr.mkdir(); tmp_out.mkdir()
+
+            # Prepare batch
+            valid_pairs = 0
+            for lr_p_src in batch_paths:
+                if (hr_p_src := hr_matched / lr_p_src.name).exists():
+                    try:
+                        shutil.copy2(lr_p_src, tmp_lr / lr_p_src.name)
+                        shutil.copy2(hr_p_src, tmp_hr / lr_p_src.name)
+                        valid_pairs += 1
+                    except Exception as e:
+                        print(f"    Error copying {lr_p_src.name}: {e}")
+
+            if valid_pairs == 0:
+                print(f"    No valid pairs for batch{batch_suffix}. Skipping.")
+                shutil.rmtree(tmp_base)
+                continue
+
+            print(f"    Prepared {valid_pairs} valid pairs for alignment")
+
+            # Run ImageAlign with streaming output
+            cmd = [imgalign_exe, "-s", str(config.IMG_ALIGN_SCALE), "-m", "0", 
+                   "-g", str(tmp_hr), "-l", str(tmp_lr), "-c", "-i", "-1", "-j", "-ai", 
+                   "-o", str(tmp_out)]
+            
+            success = run_imgalign_with_streaming(cmd, vid_name, batch_suffix, timeout_seconds)
+            
+            if not success:
+                shutil.rmtree(tmp_base)
+                continue
+
+            # Process results
+            moved, skipped = process_imgalign_results(tmp_out, final_lr, final_hr, final_ov, vid_name, batch_suffix)
+            print(f"    Batch{batch_suffix}: Moved {moved} aligned pairs, skipped {skipped} artifacts")
+            shutil.rmtree(tmp_base)
+
         update_progress(prog_file, stage, item=vid_name)
 
     update_progress(prog_file, stage, completed=True)
@@ -1225,7 +1368,7 @@ if __name__ == "__main__":
     if config.ENABLE_SISR_FILTERING: sisr_fld.mkdir(exist_ok=True)
 
     print("--- Pipeline Configuration ---")
-    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("Content Fix", config.ATTEMPT_CONTENT_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("SISR Filtering", config.ENABLE_SISR_FILTERING)]:
+    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("HDR Mode", getattr(config, 'HDR_TONE_MAPPING_MODE', 'hr_only')), ("Content Fix", config.ATTEMPT_CONTENT_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("ImgAlign Timeout", f"{config.IMG_ALIGN_TIMEOUT_HOURS}h"), ("ImgAlign Batch Size", config.IMG_ALIGN_MAX_BATCH_SIZE), ("SISR Filtering", config.ENABLE_SISR_FILTERING)]:
         print(f"{k}: {v}")
     if config.ENABLE_SISR_FILTERING and not SISR_AVAILABLE: print("  WARNING: SISR N/A (libs). Will be skipped.")
     elif config.ENABLE_SISR_FILTERING: print(f"  SISR: CLIP Dist={config.SISR_MIN_CLIP_DISTANCE}, Complexity={config.SISR_COMPLEXITY_THRESHOLD}, Brightness={config.SISR_MAX_BRIGHTNESS}")
@@ -1259,7 +1402,7 @@ if __name__ == "__main__":
         print("Skipping pHash Deduplication (disabled).")
     
     print("\n=== Stage 4: Final Alignment ===")
-    align_images(lr_matched_out, hr_matched_out, aligned_fld, prog_f)
+    align_images_with_streaming_output(lr_matched_out, hr_matched_out, aligned_fld, prog_f)
 
     print("\n=== Stage 5: SISR Curation (Optional) ===")
     if config.ENABLE_SISR_FILTERING:
@@ -1278,4 +1421,3 @@ if __name__ == "__main__":
     if config.ENABLE_SISR_FILTERING and (sisr_lr := sisr_fld / "LR").exists(): print(f"SISR filtered pairs: {len(list(sisr_lr.glob('*.png')))}")
     print(f"\nOutput directory: {out_base}")
     print("Pipeline completed successfully!")
-# --- END OF FILE srdc_pipeline.py ---
