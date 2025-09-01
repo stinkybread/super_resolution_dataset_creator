@@ -53,9 +53,6 @@ Input Videos (LR/HR)
 [ 6. Alignment ] ──> (Spatially aligns the final pairs using ImgAlign)
      │
      ▼
-[ 7. SISR Filtering (Optional) ] ──> (Selects a diverse subset using CLIP)
-     │
-     ▼
 Final Paired Dataset
 ```
 
@@ -137,9 +134,6 @@ OUTPUT_BASE_FOLDER/
 │   ├── LR/
 │   ├── HR/
 │   └── Overlay/                # Visualizations of the alignment.
-├── 4_SISR_FILTERED/            # Optional, highly-curated final dataset.
-│   ├── LR/
-│   └── HR/
 └── progress.json               # Tracks pipeline state for resumption.
 ```
 
